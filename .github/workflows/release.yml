@@ -64,7 +64,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asset="llama-${LLAMA_CPP_RELEASE_TAG}-bin-${{ matrix.llama_asset_suffix }}"
+          asset="llama-${LLAMA_CPP_RELEASE_TAG}-bin-${{ matrix.llama_asset_suffix }}.tar.gz"
           url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE_TAG}/${asset}"
           echo "baixando ${url}"
           curl -sL --fail -o /tmp/llama-release.tar.gz "${url}"
