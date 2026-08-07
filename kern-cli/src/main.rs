@@ -139,13 +139,28 @@ fn resolve_project(name: &str) -> anyhow::Result<PathBuf> {
 /// CatchUpScan — reuses the same hash-diff as the watcher to recover from
 /// lag (design rationale kept in the maintainer's private delivery
 /// workspace, not published in this repo). Chunk+embed+index always
-/// happens; ontology enrichment (extract+judge per chunk, see
-/// docs/architecture/sequences/seq-ingestao-e-ontologia.drawio) only
-/// happens when `ontology_engine` is `Some` — it is `None` when Ollama is
-/// not available (the embedded backend only covers embedding, see
-/// `spawn_embedded_embedder`). An isolated enrichment failure on one chunk
-/// never aborts the vector indexing of the others — it's an enhancement,
-/// not a requirement for the chunk to become searchable.
+/// happens. Ontology enrichment only happens when `ontology_engine` is
+/// `Some` — it is `None` when Ollama is not available (the embedded
+/// backend only covers embedding, see `spawn_embedded_embedder`). An
+/// isolated enrichment failure on one file/chunk never aborts the vector
+/// indexing of the rest — it's an enhancement, not a requirement for a
+/// chunk to become searchable.
+///
+/// Two enrichment paths, not one:
+/// - **Frontmatter** (`OntologyEngine::process_frontmatter`) runs once per
+///   file, before the per-chunk loop, using the whole file's content and
+///   the first chunk's id as evidence (`kern-ingest`'s chunker never
+///   splits before the first heading, so a `---...---` block always ends
+///   up in chunk 0). Deterministic: no distance, no `judge()` for this
+///   file's own entity/relations.
+/// - **Prose** (`OntologyEngine::process_chunk`) runs per chunk, via
+///   `extract()` + distance + merge/new-type/judge. When a file has
+///   frontmatter, chunk 0 is skipped for prose extraction — it's the raw
+///   YAML block, not prose, and feeding it to an LLM produces noise (real
+///   finding: candidates literally named "component", "string" — YAML
+///   syntax words, not real entities). Every other chunk of the file
+///   (the real body content) still goes through prose extraction as
+///   normal.
 async fn catch_up_scan(
     root: &Path,
     vector_store: &dyn VectorStore,
@@ -158,17 +173,42 @@ async fn catch_up_scan(
     for entry in walk_markdown_files(root)? {
         let content = std::fs::read_to_string(&entry)?;
         let chunks = chunker.chunk(&entry, &content);
-        for chunk in chunks {
+        let entry_path = entry.to_string_lossy().to_string();
+
+        let mut skip_prose_on_first_chunk = false;
+        if let Some(engine) = ontology_engine {
+            if let Some(first_chunk) = chunks.first() {
+                match engine
+                    .process_frontmatter(&entry_path, &content, first_chunk.id)
+                    .await
+                {
+                    Ok(Some(_outcome)) => skip_prose_on_first_chunk = true,
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            file = %entry_path,
+                            "failed to process frontmatter for this file — vector indexing and prose enrichment are not affected"
+                        );
+                    }
+                }
+            }
+        }
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
             let embedding = embedder.embed(&chunk.content).await?;
             let file_path = chunk.file_path.to_string_lossy().to_string();
 
-            if let Some(engine) = ontology_engine {
-                if let Err(e) = engine.process_chunk(&chunk.content, &file_path).await {
-                    tracing::warn!(
-                        error = %e,
-                        file = %file_path,
-                        "failed to enrich ontology for this chunk — vector indexing is not affected"
-                    );
+            let is_frontmatter_chunk = i == 0 && skip_prose_on_first_chunk;
+            if !is_frontmatter_chunk {
+                if let Some(engine) = ontology_engine {
+                    if let Err(e) = engine.process_chunk(&chunk.content, &file_path).await {
+                        tracing::warn!(
+                            error = %e,
+                            file = %file_path,
+                            "failed to enrich ontology for this chunk — vector indexing is not affected"
+                        );
+                    }
                 }
             }
 
@@ -195,6 +235,14 @@ fn now_timestamp() -> String {
         .unwrap_or_default()
 }
 
+/// Sorted lexicographically before returning — `read_dir`'s order is
+/// filesystem-dependent, not alphabetical. Determinism matters beyond
+/// reproducibility: frontmatter-driven relations resolve their target by
+/// name (`OntologyEngine::resolve_or_create_placeholder_entity`), and a
+/// numbered corpus (`TASK-0001`, `TASK-0002`, ...) processed in name order
+/// hits far fewer forward references (a relation naming an id not ingested
+/// yet) than an arbitrary filesystem order would — real behavior observed
+/// while verifying this engine end to end, not a hypothetical.
 fn walk_markdown_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -212,6 +260,7 @@ fn walk_markdown_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             }
         }
     }
+    files.sort();
     Ok(files)
 }
 

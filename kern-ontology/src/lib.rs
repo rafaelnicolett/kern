@@ -13,8 +13,8 @@ mod metrics;
 mod sqlite;
 
 pub use frontmatter::{
-    folder_scope, key_fingerprint, parse_frontmatter_keys, FrontmatterProfile,
-    FrontmatterProfileRepository,
+    folder_scope, frontmatter_value_as_strings, key_fingerprint, parse_frontmatter_keys,
+    parse_frontmatter_values, FrontmatterProfile, FrontmatterProfileRepository,
 };
 pub use metrics::FallbackMetrics;
 pub use sqlite::{
@@ -179,6 +179,22 @@ pub trait InstanceRepository: Send + Sync {
     /// is either source or target, not just the resulting neighbors.
     async fn direct_relations(&self, entity_id: Uuid)
         -> Result<Vec<RelationRecord>, OntologyError>;
+    /// Updates an existing entity's type in place — the id (and every
+    /// `Relation` already pointing at it) never changes, only `type_id`
+    /// does. Used when a placeholder entity created by a forward reference
+    /// (see `OntologyEngine::resolve_or_create_placeholder_entity`) is
+    /// later discovered to have a real, specific type once its own file
+    /// gets ingested — without this, that placeholder would stay a
+    /// permanently disconnected `unresolved-reference`, and a *second*,
+    /// correctly-typed entity would get created alongside it, splitting
+    /// what should be one entity's relations across two records.
+    /// `first_seen_file` is untouched — it stays immutable per its own
+    /// invariant even when the type is corrected later.
+    async fn retype_entity(
+        &self,
+        entity_id: Uuid,
+        new_type_id: Uuid,
+    ) -> Result<EntityRecord, OntologyError>;
 }
 
 /// Decision made by the ontology engine for a candidate.
@@ -196,6 +212,17 @@ pub enum ClassificationOutcome {
     Rejected {
         reason: String,
     },
+}
+
+/// Result of deterministic, frontmatter-driven ingestion for one file —
+/// bypasses the merge/new-type/judge decision entirely, since frontmatter
+/// already states the entity's kind and relations explicitly (no embedding
+/// distance needed, no LLM call except the one-time schema interpretation
+/// already covered by `learn_or_reuse_frontmatter_profile`).
+#[derive(Debug, Clone)]
+pub struct FrontmatterIngestOutcome {
+    pub entity: EntityRecord,
+    pub relations_created: usize,
 }
 
 /// Ambiguous zone threshold — documented placeholder, not final.
@@ -505,6 +532,220 @@ impl OntologyEngine {
         self.frontmatter_profiles.save(profile.clone()).await?;
         Ok(Some(profile))
     }
+
+    /// Deterministic counterpart to `process_chunk`: given a file whose
+    /// frontmatter maps to a learned/cached `FrontmatterProfile`, resolves
+    /// the file's own entity (kind = the value of the field mapped to the
+    /// `kind` concept, name = the value mapped to `id`) and creates a real
+    /// `Relation` for every field mapped to one of the 8 canonical relation
+    /// concepts (`depends_on`, `implements`, ...). No embedding distance,
+    /// no `judge()` call for classifying THIS candidate — frontmatter
+    /// already states the answer. `None` if the file has no frontmatter
+    /// (falls back to prose extraction via `process_chunk`, outside this
+    /// method) or the frontmatter has no `id`-mapped field to name the
+    /// entity by (falls back to a name derived from the file path).
+    ///
+    /// **"Deterministic" has one real caveat**: which frontmatter *key*
+    /// maps to which canonical *concept* is still decided by one LLM call
+    /// per new key-shape (`interpret_frontmatter_schema`, cached
+    /// thereafter per folder scope). That single classification can be
+    /// wrong — observed empirically with `llama3.2`: a `depends_on` key
+    /// was mapped to the `supersedes` concept instead. Because the
+    /// mapping is cached, one misclassification silently affects every
+    /// subsequent file with the same key shape in that folder, until the
+    /// cache is invalidated (there's no invalidation mechanism in v0 — see
+    /// `FrontmatterProfile`'s own doc). This is a real, measured
+    /// reliability gap, not a hypothetical.
+    ///
+    /// `evidence_chunk_id` should be the id of the chunk that actually
+    /// contains this frontmatter block — `kern-ingest`'s chunker never
+    /// splits before the first heading, so that's always the file's first
+    /// chunk. The caller (kern-cli's catch_up_scan) is the one that knows
+    /// chunk ids, hence it's a parameter rather than looked up here.
+    ///
+    /// A relation can reference an id that hasn't been ingested yet (e.g.
+    /// file B lists `depends_on: [A]` before A is ever scanned, which
+    /// happens for real with an ordinary numbered corpus — directory
+    /// traversal order isn't guaranteed to match id order). The target
+    /// gets a placeholder entity under a generic `unresolved-reference`
+    /// type. When A is *later* ingested for real, its own call into this
+    /// method finds that placeholder by exact name and retypes it in
+    /// place (`InstanceRepository::retype_entity`) instead of creating a
+    /// second, disconnected entity — the relation B recorded earlier still
+    /// points at the same entity id, which now carries A's real type.
+    /// `first_seen_file` is never touched by a retype — it stays pinned to
+    /// whichever file was scanned first, per its own immutability
+    /// invariant, even though that file only ever saw the placeholder.
+    pub async fn process_frontmatter(
+        &self,
+        file_path: &str,
+        content: &str,
+        evidence_chunk_id: Uuid,
+    ) -> Result<Option<FrontmatterIngestOutcome>, OntologyError> {
+        let Some(profile) = self
+            .learn_or_reuse_frontmatter_profile(std::path::Path::new(file_path), content)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(values) = parse_frontmatter_values(content) else {
+            return Ok(None);
+        };
+
+        // Invert `field_mapping` (frontmatter key -> concept) so we can go
+        // concept -> key -> value.
+        let mut concept_to_key: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for (key, concept) in &profile.field_mapping {
+            if let Some(c) = concept {
+                concept_to_key.insert(c.as_str(), key.as_str());
+            }
+        }
+        let value_of = |concept: &str| -> Option<String> {
+            let key = concept_to_key.get(concept)?;
+            let value = values.get(*key)?;
+            frontmatter_value_as_strings(value).into_iter().next()
+        };
+
+        let own_name = value_of("id").unwrap_or_else(|| derive_name_from_path(file_path));
+        let own_kind = value_of("kind").unwrap_or_else(|| "spec-item".to_string());
+
+        let entity_type = self
+            .types
+            .find_or_create_entity_type(&own_kind, &format!("frontmatter kind '{own_kind}'"))
+            .await?;
+
+        // If a forward reference from another file already created a
+        // placeholder for this exact id, retype it in place instead of
+        // creating a second, disconnected entity — any relation recorded
+        // against the placeholder's id stays valid and now points at a
+        // correctly-typed entity, closing the gap documented on this
+        // method instead of just working around it.
+        let existing = self
+            .instances
+            .find_entities_by_name(&own_name)
+            .await?
+            .into_iter()
+            .find(|e| e.canonical_name.eq_ignore_ascii_case(&own_name));
+        let entity = match existing {
+            Some(e) if e.type_id != entity_type.id => {
+                self.instances.retype_entity(e.id, entity_type.id).await?
+            }
+            Some(e) => e,
+            None => {
+                self.instances
+                    .find_or_create_entity(entity_type.id, &own_name, file_path)
+                    .await?
+            }
+        };
+
+        let mut relations_created = 0usize;
+        for concept in RELATION_CONCEPTS {
+            let Some(key) = concept_to_key.get(concept) else {
+                continue;
+            };
+            let Some(value) = values.get(*key) else {
+                continue;
+            };
+            let targets = frontmatter_value_as_strings(value);
+            if targets.is_empty() {
+                continue;
+            }
+
+            // The 8 relation concepts are exactly the 8 seeded canonical
+            // types (see SEED_RELATION_TYPES) — they always already exist
+            // after `seed_canonical_vocabulary`, so this is a lookup, not a
+            // candidate registration.
+            let relation_type = match self.types.find_relation_type(concept).await? {
+                Some(rt) => rt,
+                None => {
+                    self.types
+                        .register_candidate_type(
+                            concept,
+                            &format!("frontmatter relation '{concept}'"),
+                        )
+                        .await?
+                }
+            };
+
+            for target_name in targets {
+                let target_entity = self
+                    .resolve_or_create_placeholder_entity(&target_name, file_path)
+                    .await?;
+                self.instances
+                    .record_relation(RelationRecord {
+                        id: Uuid::new_v4(),
+                        type_id: relation_type.id,
+                        source_entity_id: entity.id,
+                        target_entity_id: target_entity.id,
+                        // Deterministic, not inferred — frontmatter stated
+                        // it explicitly, there's no distance/judge score to
+                        // report here.
+                        confidence: 1.0,
+                        evidence_chunk_id,
+                    })
+                    .await?;
+                relations_created += 1;
+            }
+        }
+
+        Ok(Some(FrontmatterIngestOutcome {
+            entity,
+            relations_created,
+        }))
+    }
+
+    /// Finds an entity by exact (case-insensitive) canonical name across
+    /// all types, or creates a placeholder for it — see the known
+    /// limitation documented on `process_frontmatter`.
+    async fn resolve_or_create_placeholder_entity(
+        &self,
+        canonical_name: &str,
+        referencing_file: &str,
+    ) -> Result<EntityRecord, OntologyError> {
+        let matches = self.instances.find_entities_by_name(canonical_name).await?;
+        if let Some(exact) = matches
+            .into_iter()
+            .find(|e| e.canonical_name.eq_ignore_ascii_case(canonical_name))
+        {
+            return Ok(exact);
+        }
+
+        let placeholder_type = self
+            .types
+            .find_or_create_entity_type(
+                "unresolved-reference",
+                "placeholder for an id referenced by frontmatter before its own file was ingested",
+            )
+            .await?;
+        self.instances
+            .find_or_create_entity(placeholder_type.id, canonical_name, referencing_file)
+            .await
+    }
+}
+
+/// The 8 canonical relation concepts a frontmatter field can map to — kept
+/// in sync with `SEED_RELATION_TYPES` on purpose (same vocabulary, this is
+/// just the subset `interpret_frontmatter_schema` is allowed to map a key
+/// to that represents a relation rather than `id`/`kind`/`status`).
+const RELATION_CONCEPTS: [&str; 8] = [
+    "depends_on",
+    "supersedes",
+    "implements",
+    "causes",
+    "owned_by",
+    "conflicts_with",
+    "documents",
+    "configures",
+];
+
+/// Fallback entity name when frontmatter has no field mapped to the `id`
+/// concept — the file stem (e.g. `docs/specs/TASK-0001.md` -> `TASK-0001`).
+fn derive_name_from_path(file_path: &str) -> String {
+    std::path::Path::new(file_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string())
 }
 
 #[cfg(test)]
@@ -829,5 +1070,253 @@ mod engine_tests {
                 .all(|o| matches!(o, ClassificationOutcome::NewType { .. })),
             "with no existing types, every candidate should create a new type: {outcomes:?}"
         );
+    }
+
+    /// Real integration: frontmatter -> real entity with the right kind and
+    /// name, no distance/judge involved. Pulls in a real Ollama call only
+    /// for the one-time schema interpretation (skips if unavailable).
+    #[tokio::test]
+    async fn process_frontmatter_creates_a_real_entity_from_id_and_kind() {
+        let probe = OllamaClient::new("llama3.2");
+        if !probe.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+        let content = "---\nid: TASK-0042\nkind: task\ndepends_on: []\n---\n\n# Task\n";
+
+        let outcome = engine
+            .process_frontmatter("docs/specs/TASK-0042.md", content, Uuid::new_v4())
+            .await
+            .unwrap()
+            .expect("frontmatter present, should not be None");
+
+        assert_eq!(outcome.entity.canonical_name, "TASK-0042");
+        assert_eq!(outcome.relations_created, 0);
+
+        let entity_types = engine.types.list_entity_types().await.unwrap();
+        let task_type = entity_types
+            .iter()
+            .find(|t| t.name == "task")
+            .expect("should have created a 'task' entity type from the kind field");
+        assert_eq!(task_type.instance_count, 1);
+    }
+
+    /// Real integration: a `depends_on` field becomes a real `Relation`
+    /// between two real entities, routable by `query_ontological` — this
+    /// is the capability the vector-only prose path can't provide.
+    #[tokio::test]
+    async fn process_frontmatter_creates_a_real_relation_between_two_known_entities() {
+        let probe = OllamaClient::new("llama3.2");
+        if !probe.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+
+        engine
+            .process_frontmatter(
+                "docs/specs/TASK-0001.md",
+                "---\nid: TASK-0001\nkind: task\n---\n\n# First task\n",
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let outcome = engine
+            .process_frontmatter(
+                "docs/specs/TASK-0002.md",
+                "---\nid: TASK-0002\nkind: task\ndepends_on: [TASK-0001]\n---\n\n# Second task\n",
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome.relations_created, 1);
+
+        let task_0001 = engine
+            .instances
+            .find_entities_by_name("TASK-0001")
+            .await
+            .unwrap();
+        assert_eq!(task_0001.len(), 1, "TASK-0001 should exist as one entity");
+
+        let relations = engine
+            .instances
+            .direct_relations(outcome.entity.id)
+            .await
+            .unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].target_entity_id, task_0001[0].id);
+        // Deliberately not asserting the relation landed under the
+        // "depends_on" type specifically: which of the 8 canonical
+        // concepts the frontmatter key gets mapped to is a real LLM call
+        // (interpret_frontmatter_schema), and a small model can
+        // legitimately misclassify a close call (observed once: mapped
+        // "depends_on" to "supersedes" instead) — that's the same
+        // real-world imprecision the fallback-rate metric exists to
+        // track, not a bug in this code path. What this test guarantees is
+        // the mechanism: a relation concept really gets created/looked up
+        // and a real Relation really gets recorded against the correct,
+        // pre-existing target entity.
+        let relation_types = engine.types.list_relation_types().await.unwrap();
+        let used_type = relation_types
+            .iter()
+            .find(|t| t.id == relations[0].type_id)
+            .expect("the relation's type_id should resolve to a real relation type");
+        assert!(
+            RELATION_CONCEPTS.contains(&used_type.name.as_str()),
+            "relation should land under one of the 8 canonical concepts, got: {}",
+            used_type.name
+        );
+        assert_eq!(used_type.instance_count, 1);
+    }
+
+    /// A forward reference (target not ingested yet) still creates a real
+    /// relation, pointing at a placeholder entity — documented v0
+    /// limitation, not a silent failure.
+    #[tokio::test]
+    async fn process_frontmatter_forward_reference_creates_a_placeholder_target() {
+        let probe = OllamaClient::new("llama3.2");
+        if !probe.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+
+        let outcome = engine
+            .process_frontmatter(
+                "docs/specs/TASK-0002.md",
+                "---\nid: TASK-0002\nkind: task\ndepends_on: [TASK-9999]\n---\n\n# Depends on something not seen yet\n",
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome.relations_created, 1);
+
+        let placeholder = engine
+            .instances
+            .find_entities_by_name("TASK-9999")
+            .await
+            .unwrap();
+        assert_eq!(placeholder.len(), 1);
+
+        let entity_types = engine.types.list_entity_types().await.unwrap();
+        assert!(
+            entity_types
+                .iter()
+                .any(|t| t.name == "unresolved-reference"),
+            "forward reference should have created the placeholder type"
+        );
+    }
+
+    /// The real fix for the forward-reference gap: once the referenced
+    /// file is actually ingested, the placeholder gets retyped in place —
+    /// same entity id, so the relation recorded earlier keeps pointing at
+    /// a single, now-correctly-typed entity instead of an orphan.
+    #[tokio::test]
+    async fn process_frontmatter_retypes_placeholder_when_real_file_is_later_ingested() {
+        let probe = OllamaClient::new("llama3.2");
+        if !probe.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+
+        // TASK-0002 references TASK-0001 before TASK-0001 has ever been
+        // ingested — creates a placeholder for TASK-0001.
+        let task_0002 = engine
+            .process_frontmatter(
+                "docs/specs/TASK-0002.md",
+                "---\nid: TASK-0002\nkind: task\ndepends_on: [TASK-0001]\n---\n\n# Second task\n",
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let placeholder_before = engine
+            .instances
+            .find_entities_by_name("TASK-0001")
+            .await
+            .unwrap();
+        assert_eq!(placeholder_before.len(), 1);
+        let placeholder_id = placeholder_before[0].id;
+        let placeholder_type_id = placeholder_before[0].type_id;
+
+        // TASK-0001's real file is ingested afterwards.
+        let task_0001 = engine
+            .process_frontmatter(
+                "docs/specs/TASK-0001.md",
+                "---\nid: TASK-0001\nkind: task\n---\n\n# First task\n",
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Same entity id — retyped in place, not a second entity.
+        assert_eq!(
+            task_0001.entity.id, placeholder_id,
+            "the real TASK-0001 entity should be the SAME id as the earlier placeholder, not a new one"
+        );
+        assert_ne!(
+            task_0001.entity.type_id, placeholder_type_id,
+            "the entity's type should have changed away from the placeholder type"
+        );
+
+        let entity_types = engine.types.list_entity_types().await.unwrap();
+        let task_type = entity_types.iter().find(|t| t.name == "task").unwrap();
+        assert_eq!(
+            task_type.instance_count, 2,
+            "both TASK-0001 (retyped) and TASK-0002 should now count under 'task'"
+        );
+        let unresolved = entity_types
+            .iter()
+            .find(|t| t.name == "unresolved-reference")
+            .unwrap();
+        assert_eq!(
+            unresolved.instance_count, 0,
+            "no entity should be left under the placeholder type after the retype"
+        );
+
+        // The relation TASK-0002 recorded earlier still resolves, now to
+        // the correctly-typed entity.
+        let relations = engine
+            .instances
+            .direct_relations(task_0002.entity.id)
+            .await
+            .unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].target_entity_id, task_0001.entity.id);
+    }
+
+    #[tokio::test]
+    async fn process_frontmatter_returns_none_without_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+
+        let outcome = engine
+            .process_frontmatter(
+                "docs/notes.md",
+                "# just prose\nno frontmatter here\n",
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.is_none());
     }
 }

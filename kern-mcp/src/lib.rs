@@ -388,26 +388,49 @@ impl KernServer {
         }
 
         // Try to find an entity mentioned in the question — simple v0
-        // heuristic: checks each relevant word/token as a substring of
-        // an entity name.
+        // heuristic: checks each relevant word/token as a substring of an
+        // entity name.
+        //
+        // Real bug found empirically: stopping at the FIRST word that
+        // matches anything is wrong — `find_entities_by_name` is a
+        // substring search, and a short common word (e.g. "for") can
+        // spuriously substring-match a noisy prose-extracted entity name
+        // (e.g. "spreadsheet-friendly format" contains "for"), grabbing
+        // the wrong entity before the loop ever reaches the real one
+        // later in the sentence. Two mitigations: skip a small stopword
+        // list up front, and among all words that DO match something,
+        // prefer the match from the LONGEST cleaned word — a longer token
+        // is far less likely to be an accidental substring hit and far
+        // more likely to be an actual identifier the question is about.
+        const STOPWORDS: &[&str] = &[
+            "the", "for", "and", "are", "was", "were", "has", "have", "had", "not", "but", "you",
+            "your", "with", "this", "that", "from", "what", "how", "does", "did", "who", "when",
+            "where", "which",
+        ];
         let mentioned_entity = {
-            let mut found = None;
+            let mut best_match: Option<(usize, kern_ontology::EntityRecord)> = None;
             for word in question.split_whitespace() {
                 let cleaned: String = word
                     .chars()
                     .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                     .collect();
-                if cleaned.len() < 3 {
+                if cleaned.len() < 3 || STOPWORDS.contains(&cleaned.to_lowercase().as_str()) {
                     continue;
                 }
                 if let Ok(mut matches) = self.instances.find_entities_by_name(&cleaned).await {
                     if !matches.is_empty() {
-                        found = Some(matches.remove(0));
-                        break;
+                        let candidate = matches.remove(0);
+                        let is_longer = best_match
+                            .as_ref()
+                            .map(|(len, _)| cleaned.len() > *len)
+                            .unwrap_or(true);
+                        if is_longer {
+                            best_match = Some((cleaned.len(), candidate));
+                        }
                     }
                 }
             }
-            found
+            best_match.map(|(_, entity)| entity)
         };
 
         if let (Some((relation_type, score)), Some(entity)) = (&best, &mentioned_entity) {
@@ -773,6 +796,78 @@ mod tests {
 
         assert_eq!(output.mode, "graph_traversal");
         assert!(!output.evidence.is_empty());
+    }
+
+    /// Real bug found empirically against a real corpus (not this minimal
+    /// fixture — the entity-mention heuristic used to stop at the FIRST
+    /// word that matched anything, and a stopword like "for" spuriously
+    /// substring-matched a noisy entity named "spreadsheet-friendly
+    /// format", grabbing the wrong entity before the loop ever reached the
+    /// real one named later in the question). This test plants that exact
+    /// kind of distractor on purpose to lock the fix in.
+    #[tokio::test]
+    async fn query_ontological_ignores_stopword_collision_with_a_distractor_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (srv, _) = server(dir.path()).await;
+
+        if !OllamaClient::new("all-minilm").probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        srv.types.seed_canonical_vocabulary().await.unwrap();
+        let depends_on = srv
+            .types
+            .find_relation_type("depends_on")
+            .await
+            .unwrap()
+            .unwrap();
+        let entity_type = srv
+            .types
+            .find_or_create_entity_type("Task", "a task")
+            .await
+            .unwrap();
+
+        // Distractor: "for" is a substring of "format", and is a common
+        // enough word to appear early in a natural-language question.
+        srv.instances
+            .find_or_create_entity(entity_type.id, "spreadsheet-friendly format", "noise.md")
+            .await
+            .unwrap();
+
+        let task_a = srv
+            .instances
+            .find_or_create_entity(entity_type.id, "TASK-002", "a.md")
+            .await
+            .unwrap();
+        let task_b = srv
+            .instances
+            .find_or_create_entity(entity_type.id, "TASK-001", "b.md")
+            .await
+            .unwrap();
+        srv.instances
+            .record_relation(kern_ontology::RelationRecord {
+                id: Uuid::new_v4(),
+                type_id: depends_on.id,
+                source_entity_id: task_a.id,
+                target_entity_id: task_b.id,
+                confidence: 1.0,
+                evidence_chunk_id: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+
+        let Json(output) = srv
+            .query_ontological(Parameters(QueryOntologicalInput {
+                question: "what is the depends_on relation for TASK-002?".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.mode, "graph_traversal",
+            "the stopword 'for' should never win over the real entity 'TASK-002' mentioned later"
+        );
     }
 
     #[tokio::test]

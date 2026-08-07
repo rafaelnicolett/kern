@@ -33,6 +33,43 @@ pub fn parse_frontmatter_keys(content: &str) -> Option<Vec<String>> {
     Some(keys)
 }
 
+/// Extracts the parsed `key -> value` mapping from the same `---\n...\n---`
+/// block `parse_frontmatter_keys` reads. Kept separate from
+/// `parse_frontmatter_keys` on purpose: the profile cache is keyed only on
+/// the key *set* (never values, see `key_fingerprint`), while resolving a
+/// specific file's own entity/relations needs the real values too. `None`
+/// under the same conditions as `parse_frontmatter_keys`.
+pub fn parse_frontmatter_values(content: &str) -> Option<serde_yaml::Mapping> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let yaml_block = &rest[..end];
+
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml_block).ok()?;
+    value.as_mapping().cloned()
+}
+
+/// Normalizes a frontmatter value into one-or-many strings: a scalar
+/// (`depends_on: TASK-0001`) becomes a single-item list, a sequence
+/// (`depends_on: [TASK-0001, TASK-0002]`) becomes each item stringified.
+/// Anything else (map, null) yields an empty list — not every field is a
+/// reference list.
+pub fn frontmatter_value_as_strings(value: &serde_yaml::Value) -> Vec<String> {
+    match value {
+        serde_yaml::Value::String(s) => vec![s.clone()],
+        serde_yaml::Value::Number(n) => vec![n.to_string()],
+        serde_yaml::Value::Sequence(items) => items
+            .iter()
+            .filter_map(|v| match v {
+                serde_yaml::Value::String(s) => Some(s.clone()),
+                serde_yaml::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Fingerprint of the SET of keys — never the values. Two shapes with the
 /// same keys in different orders produce the same fingerprint
 /// (`parse_frontmatter_keys` already returns them sorted).
@@ -86,6 +123,34 @@ mod tests {
     #[test]
     fn parse_returns_none_without_frontmatter() {
         assert!(parse_frontmatter_keys("# just a title\nno frontmatter\n").is_none());
+    }
+
+    #[test]
+    fn parse_values_reads_scalars_and_sequences() {
+        let content =
+            "---\nid: TASK-0042\nkind: task\ndepends_on: [TASK-0001, TASK-0002]\n---\n\n# body\n";
+        let values = parse_frontmatter_values(content).unwrap();
+        let id = values.get("id").unwrap();
+        assert_eq!(frontmatter_value_as_strings(id), vec!["TASK-0042"]);
+        let depends_on = values.get("depends_on").unwrap();
+        assert_eq!(
+            frontmatter_value_as_strings(depends_on),
+            vec!["TASK-0001", "TASK-0002"]
+        );
+    }
+
+    #[test]
+    fn value_as_strings_wraps_a_lone_scalar_in_a_single_item_list() {
+        let value = serde_yaml::Value::String("TASK-0001".to_string());
+        assert_eq!(frontmatter_value_as_strings(&value), vec!["TASK-0001"]);
+    }
+
+    #[test]
+    fn value_as_strings_is_empty_for_an_empty_sequence() {
+        let content = "---\nid: TASK-0042\ndepends_on: []\n---\n";
+        let values = parse_frontmatter_values(content).unwrap();
+        let depends_on = values.get("depends_on").unwrap();
+        assert!(frontmatter_value_as_strings(depends_on).is_empty());
     }
 
     #[test]

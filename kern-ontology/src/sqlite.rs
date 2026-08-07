@@ -4,7 +4,7 @@
 //!
 //! `rusqlite::Connection` is not `Sync` — every call runs in
 //! `spawn_blocking` over a connection guarded by a `Mutex`, never directly
-//! on the Tokio runtime (per the lang-rust skill, section 2.4).
+//! on the Tokio runtime.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,53 @@ fn open_connection(path: &Path) -> Result<Connection, OntologyError> {
     })?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     Ok(conn)
+}
+
+/// All 5 tables, created by whichever repository opens the file first —
+/// `SqliteTypeRepository` and `SqliteInstanceRepository` are two
+/// independent `Connection`s over the *same* physical file
+/// (`<project>/.kern/registry.db`), and `list_entity_types`/
+/// `list_relation_types` compute `instance_count` via a live JOIN across
+/// both repositories' tables (see the comment on `entity_types` below) —
+/// so every table needs to exist regardless of which repository is opened
+/// first, or opened alone (as several unit tests do).
+fn ensure_schema(conn: &Connection) -> Result<(), OntologyError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS entity_types (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS relation_types (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS relation_type_hits (
+            type_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            PRIMARY KEY (type_id, file_path)
+        );
+        CREATE TABLE IF NOT EXISTS entities (
+            id TEXT PRIMARY KEY,
+            type_id TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            first_seen_file TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS relations (
+            id TEXT PRIMARY KEY,
+            type_id TEXT NOT NULL,
+            source_entity_id TEXT NOT NULL,
+            target_entity_id TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            evidence_chunk_id TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
 }
 
 fn status_to_str(status: RelationTypeStatus) -> &'static str {
@@ -58,28 +105,14 @@ pub struct SqliteTypeRepository {
 impl SqliteTypeRepository {
     pub fn open(path: &Path) -> Result<Self, OntologyError> {
         let conn = open_connection(path)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS entity_types (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                description TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                instance_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS relation_types (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                description TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                instance_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS relation_type_hits (
-                type_id TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                PRIMARY KEY (type_id, file_path)
-            );",
-        )?;
+        // instance_count is intentionally NOT a stored column (see ADR-0002:
+        // "derived from the Instance Graph, the Type Registry doesn't own
+        // this number, only exposes it") — every query below computes it
+        // live via COUNT(*) LEFT JOIN against `entities`/`relations`. A
+        // stored counter was tried first and never got updated anywhere,
+        // silently reporting 0 forever — a real bug found empirically while
+        // verifying the ontology engine end to end.
+        ensure_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -128,12 +161,15 @@ impl TypeRepository for SqliteTypeRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "INSERT OR IGNORE INTO entity_types (id, name, description, created_at, instance_count)
-                 VALUES (?1, ?2, ?3, ?4, 0)",
+                "INSERT OR IGNORE INTO entity_types (id, name, description, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
                 params![Uuid::new_v4().to_string(), name, description, now()],
             )?;
             let mut stmt = conn.prepare(
-                "SELECT id, name, description, instance_count FROM entity_types WHERE name = ?1",
+                "SELECT et.id, et.name, et.description, COUNT(e.id)
+                 FROM entity_types et LEFT JOIN entities e ON e.type_id = et.id
+                 WHERE et.name = ?1
+                 GROUP BY et.id",
             )?;
             let record = stmt.query_row(params![name], Self::row_to_entity_type)?;
             Ok::<_, OntologyError>(record)
@@ -147,8 +183,8 @@ impl TypeRepository for SqliteTypeRepository {
             let conn = conn.lock().unwrap();
             for name in SEED_RELATION_TYPES {
                 conn.execute(
-                    "INSERT OR IGNORE INTO relation_types (id, name, description, status, created_at, instance_count)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    "INSERT OR IGNORE INTO relation_types (id, name, description, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         Uuid::new_v4().to_string(),
                         name,
@@ -172,7 +208,10 @@ impl TypeRepository for SqliteTypeRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT id, name, description, status, instance_count FROM relation_types WHERE name = ?1",
+                "SELECT rt.id, rt.name, rt.description, rt.status, COUNT(r.id)
+                 FROM relation_types rt LEFT JOIN relations r ON r.type_id = rt.id
+                 WHERE rt.name = ?1
+                 GROUP BY rt.id",
             )?;
             let record = stmt
                 .query_row(params![name], Self::row_to_relation_type)
@@ -193,8 +232,8 @@ impl TypeRepository for SqliteTypeRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "INSERT OR IGNORE INTO relation_types (id, name, description, status, created_at, instance_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                "INSERT OR IGNORE INTO relation_types (id, name, description, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     Uuid::new_v4().to_string(),
                     name,
@@ -204,7 +243,10 @@ impl TypeRepository for SqliteTypeRepository {
                 ],
             )?;
             let mut stmt = conn.prepare(
-                "SELECT id, name, description, status, instance_count FROM relation_types WHERE name = ?1",
+                "SELECT rt.id, rt.name, rt.description, rt.status, COUNT(r.id)
+                 FROM relation_types rt LEFT JOIN relations r ON r.type_id = rt.id
+                 WHERE rt.name = ?1
+                 GROUP BY rt.id",
             )?;
             let record = stmt.query_row(params![name], Self::row_to_relation_type)?;
             Ok::<_, OntologyError>(record)
@@ -253,7 +295,10 @@ impl TypeRepository for SqliteTypeRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT id, name, description, instance_count FROM entity_types ORDER BY name",
+                "SELECT et.id, et.name, et.description, COUNT(e.id)
+                 FROM entity_types et LEFT JOIN entities e ON e.type_id = et.id
+                 GROUP BY et.id
+                 ORDER BY et.name",
             )?;
             let rows = stmt
                 .query_map(params![], Self::row_to_entity_type)?
@@ -268,7 +313,10 @@ impl TypeRepository for SqliteTypeRepository {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT id, name, description, status, instance_count FROM relation_types ORDER BY name",
+                "SELECT rt.id, rt.name, rt.description, rt.status, COUNT(r.id)
+                 FROM relation_types rt LEFT JOIN relations r ON r.type_id = rt.id
+                 GROUP BY rt.id
+                 ORDER BY rt.name",
             )?;
             let rows = stmt
                 .query_map(params![], Self::row_to_relation_type)?
@@ -287,23 +335,7 @@ pub struct SqliteInstanceRepository {
 impl SqliteInstanceRepository {
     pub fn open(path: &Path) -> Result<Self, OntologyError> {
         let conn = open_connection(path)?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS entities (
-                id TEXT PRIMARY KEY,
-                type_id TEXT NOT NULL,
-                canonical_name TEXT NOT NULL,
-                first_seen_file TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS relations (
-                id TEXT PRIMARY KEY,
-                type_id TEXT NOT NULL,
-                source_entity_id TEXT NOT NULL,
-                target_entity_id TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                evidence_chunk_id TEXT NOT NULL
-            );",
-        )?;
+        ensure_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -583,6 +615,28 @@ impl InstanceRepository for SqliteInstanceRepository {
         })
         .await?
     }
+
+    async fn retype_entity(
+        &self,
+        entity_id: Uuid,
+        new_type_id: Uuid,
+    ) -> Result<EntityRecord, OntologyError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE entities SET type_id = ?1 WHERE id = ?2",
+                params![new_type_id.to_string(), entity_id.to_string()],
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT id, type_id, canonical_name, first_seen_file, updated_at
+                 FROM entities WHERE id = ?1",
+            )?;
+            let record = stmt.query_row(params![entity_id.to_string()], Self::row_to_entity)?;
+            Ok::<_, OntologyError>(record)
+        })
+        .await?
+    }
 }
 
 /// Real adapter for the Frontmatter Profile aggregate.
@@ -710,6 +764,78 @@ mod tests {
             let record = repo.find_relation_type(name).await.unwrap().unwrap();
             assert_eq!(record.status, RelationTypeStatus::Canonical);
         }
+    }
+
+    #[tokio::test]
+    async fn instance_count_reflects_real_entities_and_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("registry.db");
+        let types = SqliteTypeRepository::open(&db_path).unwrap();
+        let instances = SqliteInstanceRepository::open(&db_path).unwrap();
+        types.seed_canonical_vocabulary().await.unwrap();
+
+        let entity_type = types
+            .find_or_create_entity_type("Crate", "a crate")
+            .await
+            .unwrap();
+        assert_eq!(
+            entity_type.instance_count, 0,
+            "no instance created yet — should be 0, not a stale stored value"
+        );
+
+        let a = instances
+            .find_or_create_entity(entity_type.id, "kern-a", "a.md")
+            .await
+            .unwrap();
+        instances
+            .find_or_create_entity(entity_type.id, "kern-b", "b.md")
+            .await
+            .unwrap();
+
+        let refreshed = types
+            .find_or_create_entity_type("Crate", "a crate")
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.instance_count, 2,
+            "instance_count should reflect the 2 real entities just created"
+        );
+        let listed = types.list_entity_types().await.unwrap();
+        let crate_type = listed.iter().find(|t| t.name == "Crate").unwrap();
+        assert_eq!(crate_type.instance_count, 2);
+
+        let depends_on = types
+            .find_relation_type("depends_on")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(depends_on.instance_count, 0);
+
+        let b = instances
+            .find_or_create_entity(entity_type.id, "kern-b", "b.md")
+            .await
+            .unwrap();
+        instances
+            .record_relation(RelationRecord {
+                id: Uuid::new_v4(),
+                type_id: depends_on.id,
+                source_entity_id: a.id,
+                target_entity_id: b.id,
+                confidence: 1.0,
+                evidence_chunk_id: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+
+        let depends_on_refreshed = types
+            .find_relation_type("depends_on")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            depends_on_refreshed.instance_count, 1,
+            "instance_count should reflect the 1 real relation just recorded"
+        );
     }
 
     #[tokio::test]

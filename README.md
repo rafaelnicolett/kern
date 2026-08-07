@@ -8,28 +8,36 @@
 <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-1.97.1%2B-orange.svg" alt="Rust"></a>
 </p>
 
-**kern** is a local-first RAG engine with an incrementally-built ontology,
-exposed to any AI agent over MCP.
+**kern** is a local-first RAG engine built for **Spec-Driven Development** —
+the Markdown that spec-first workflows and AI coding agents already
+produce, full of frontmatter like `id`, `kind`, `depends_on`, `implements`.
+That frontmatter already *is* a relationship graph — kern parses it
+**deterministically** into real entities and typed relations, no LLM
+involved for content that's already structured. A local model only gets
+called for free-form prose that has no frontmatter to parse, or for the
+rare candidate ambiguous enough to need a judgment call against what the
+ontology already knows.
 
-Point it at a live folder of Markdown, and it keeps a local vector index
-(an embedded LanceDB) and a lightweight ontology — a curated vocabulary of
-relation types plus an instance graph — in sync as your files change. No
-external database, no GPU, no full-corpus rebuild on every edit.
+Point kern at that folder, and it keeps a local vector index (an embedded
+LanceDB) and that lightweight ontology — entities, typed relations, cited
+evidence — in sync as your specs, plans, and tasks change. No external
+database, no GPU, no full-corpus rebuild on every edit.
 
 > **Status: pre-v0, under active construction.** The CLI, the MCP contract
 > and the ontology schema can still change without notice before v1.
 > Issues and feedback are very welcome.
 
-## Why kern
+|  | kern | plain vector search | full GraphRAG (Neo4j/Qdrant) |
+|---|---|---|---|
+| External infra | none | vector database | graph database + vector database |
+| GPU | not required | not required | usually recommended |
+| Update cost | file diff | file diff | often a full rebuild |
+| Relational queries | yes, routed by type | no | yes |
 
-Plain vector search loses relational understanding as a corpus grows — "what
-depends on service X?" isn't a question embeddings answer well. Full
-GraphRAG solves that, but usually drags in heavy external infrastructure (a
-dedicated graph database, Docker/Kubernetes) and a full corpus rebuild on
-every update — a poor fit for fast local iteration.
-
-kern aims for the middle ground: an ontology that grows incrementally, with
-zero external infrastructure, on an ordinary CPU.
+Plain vector search alone still loses relational understanding as a corpus
+grows — "what depends on X?" isn't a question embeddings answer well on
+their own, which is exactly the gap the frontmatter-driven ontology closes
+without needing GraphRAG's external infrastructure.
 
 ## Principles
 
@@ -47,20 +55,26 @@ zero external infrastructure, on an ordinary CPU.
 ```mermaid
 flowchart LR
     MD(["📁 Markdown folder"]) -- watch + diff --> ING["kern-ingest<br/>chunking"]
-    ING -- chunks --> MODEL["kern-model<br/>embed / extract / judge"]
-    MODEL -- embeddings --> VEC[("kern-vector<br/>LanceDB, embedded")]
-    MODEL -- candidates --> ONT["kern-ontology<br/>type registry + instance graph"]
+    ING -- frontmatter --> FM["deterministic parse<br/>(no LLM)"]
+    ING -- free prose --> LLM["kern-model<br/>extract / judge"]
+    ING -- every chunk --> EMB["kern-model<br/>embed"]
+    EMB -- embeddings --> VEC[("kern-vector<br/>LanceDB, embedded")]
+    FM --> ONT["kern-ontology<br/>type registry + instance graph"]
+    LLM --> ONT
     VEC --> MCP["kern-mcp<br/>MCP server"]
     ONT --> MCP
     MCP -- stdio --> AGENT(["Any MCP host<br/>Claude Code, Claude Desktop, ..."])
 ```
 
 A single binary watches the folder, chunks and embeds new or changed
-content, and keeps the vector index up to date. Only when a candidate
-entity falls into the ambiguous zone against the existing ontology does it
-ask a local model to decide: merge into an existing type, promote to a new
-one, or discard. See [`docs/adr`](docs/adr) for the architecture decision
-history.
+content, and keeps the vector index up to date. Frontmatter fields that map
+to a known concept (`id`, `kind`, `depends_on`, `implements`, ...) become a
+real entity and real relations immediately — no distance computation, no
+model call beyond the one-time, cached interpretation of a new frontmatter
+shape. Free-form prose (or the ambiguous case even the ontology's own
+distance check can't resolve) is what asks a local model to decide: merge
+into an existing type, promote to a new one, or discard. See
+[`docs/adr`](docs/adr) for the architecture decision history.
 
 ### Model backend
 
@@ -189,6 +203,76 @@ See
 [`docs/architecture/mcp-tool-contract.md`](docs/architecture/mcp-tool-contract.md)
 for the full contract.
 
+## Examples
+
+[`examples/sample-specs/`](examples/sample-specs) is a small, real
+Spec-Driven Development corpus: a spec, a plan, and two tasks with
+frontmatter (`id`, `kind`, `status`, `depends_on`, `implements`), plus one
+free-form file with no frontmatter at all, to exercise the prose fallback
+path. Try it yourself:
+
+```bash
+kern project create demo --path examples/sample-specs
+python3 examples/query_ontological.py target/release/kern demo \
+  "what is the depends_on relation for TASK-002?"
+```
+
+The transcripts below are copied verbatim from that command against a real
+MCP session (`tools/call` over stdio, not simulated output) —
+[`examples/query_ontological.py`](examples/query_ontological.py) is the
+exact driver script, real and runnable, not a doc-only snippet. Ollama was
+running locally (`all-minilm` for embeddings, `llama3.2` for extraction and
+judging).
+
+**A question that routes by relation type** — `TASK-002`'s frontmatter
+(`depends_on: [TASK-001]`) was parsed deterministically into a real
+`depends_on` relation; `query_ontological` finds it via graph traversal,
+not vector search:
+
+```
+> query_ontological({"question": "what is the depends_on relation for TASK-002?"})
+
+{
+  "mode": "graph_traversal",
+  "answer": "TASK-002 has 1 relation(s) of type 'depends_on'",
+  "evidence": [
+    {
+      "chunk_id": "af6d9596-0faa-4c42-a2be-6f5e8d4da481",
+      "excerpt": "see evidence chunk via search_hybrid"
+    }
+  ]
+}
+```
+
+**A question with no relation-type match** — falls back to `search_hybrid`
+over the free-form `design-notes.md` file, which has no frontmatter and
+went through prose extraction instead:
+
+```
+> query_ontological({"question": "how does the export handle large row counts?"})
+
+{
+  "mode": "vector_fallback",
+  "answer": "# Design notes: CSV export\n\nThis file has no frontmatter on purpose — it's the free-form counterpart to\nthe specs/plan/tasks in `.specify/specs/`, meant to exercise kern's prose\nfallback path rather than the deterministic frontmatter path.\n\nRow streaming for the export endpoint is implemented with a cursor-based\ndatabase query rather than `OFFSET`/`LIMIT` paging, since offset pagination\ndegrades badly past a few hundred thousand rows — exactly the range\nSPEC-001 asks this to handle. The dashboard's CSV button reuses the same\nfilter-serialization helper the dashboard's own data-fetching code already\nuses, so the exported rows always match what's on screen.\n",
+  "evidence": [
+    { "chunk_id": "79897d41-...", "excerpt": "# Design notes: CSV export\n\n..." },
+    { "chunk_id": "3130dd70-...", "excerpt": "## Requirements\n\n- A logged-in user can export..." },
+    { "chunk_id": "64bd4542-...", "excerpt": "# Implementation plan: CSV export\n\n..." }
+  ]
+}
+```
+
+**Getting a `graph_traversal` result reliably depends on how the question
+is phrased**, and this is worth being honest about: `query_ontological`'s
+semantic router embeds the question and compares it against each relation
+type's (fairly generic, seeded) description — a question that echoes the
+relation's name closely (`depends_on`) scores well above the routing
+threshold; a more naturally-phrased one ("what does TASK-002 *depend on*?")
+scored well under it in testing. This is a real, current limitation of the
+v0 router, not fabricated behavior — improving it (richer canonical
+descriptions, a better routing signal than raw cosine similarity over a
+short template string) is open work.
+
 ## v0 scope
 
 1. Markdown-aware ingestion, chunking, and local vector indexing (embedded
@@ -218,6 +302,13 @@ kern-cli/        the `kern` binary: project create, serve, status
 
 Hexagonal architecture (ports & adapters), traits-first — see [`docs/adr/`](docs/adr)
 for the decision history.
+
+## Benchmarks
+
+Real, reproducible, small-corpus numbers (fallback rate, memory/CPU) live
+in [`BENCHMARKS.md`](BENCHMARKS.md), with the exact methodology to
+reproduce each one — no comparison against other tools is included until
+that can be done with a declared, verified configuration on both sides.
 
 ## Contributing
 

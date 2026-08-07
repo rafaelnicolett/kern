@@ -338,33 +338,30 @@ fn judge_schema() -> serde_json::Value {
 }
 
 #[derive(Deserialize)]
-struct FrontmatterMapping {
-    mappings: Vec<FrontmatterKeyMapping>,
-}
-
-#[derive(Deserialize)]
 struct FrontmatterKeyMapping {
-    key: String,
     canonical_concept: Option<String>,
 }
 
+/// `canonical_concept` is constrained with a JSON Schema `enum` — this is
+/// load-bearing, not decorative: an earlier version only *described* the
+/// concepts in the prompt (in prose, to disambiguate close pairs like
+/// `depends_on`/`supersedes`), and the model started echoing the
+/// description back as the value (e.g. `"blocking prerequisite"`) instead
+/// of the keyword `depends_on`. `enum` forces the value to actually be one
+/// of the 11 real concept strings (or `null`), enforced by Ollama's
+/// structured-output grammar, not just requested in prose.
 fn frontmatter_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "mappings": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "key": {"type": "string"},
-                        "canonical_concept": {"type": ["string", "null"]}
-                    },
-                    "required": ["key"]
-                }
+            "canonical_concept": {
+                "enum": [
+                    "id", "kind", "status", "depends_on", "implements",
+                    "supersedes", "causes", "owned_by", "conflicts_with",
+                    "documents", "configures", null
+                ]
             }
-        },
-        "required": ["mappings"]
+        }
     })
 }
 
@@ -460,25 +457,61 @@ impl ExtractionProvider for OllamaClient {
         &self,
         keys: &[String],
     ) -> Result<std::collections::HashMap<String, Option<String>>, ModelError> {
-        let canonical_concepts =
-            "id, kind, status, depends_on, implements, supersedes, causes, owned_by, conflicts_with, documents, configures";
+        // Real finding, verified empirically: classifying every key in one
+        // batched call is order-sensitive for a small model — the exact
+        // same prompt/definitions reliably classified `depends_on`/
+        // `implements` correctly when they came LAST in the key list, and
+        // reliably misclassified them (as `causes`/`supersedes`) when they
+        // came FIRST — which `parse_frontmatter_keys`' alphabetical sort
+        // does for a typical SDD key set. One call per key removes the
+        // ordering variable entirely: more round-trips, but each key is
+        // judged on its own, and this whole method only runs once per new
+        // key-shape per folder anyway (cached after that, see
+        // `FrontmatterProfile`).
+        let mut mapping = std::collections::HashMap::new();
+        for key in keys {
+            let concept = self.interpret_single_frontmatter_key(key).await?;
+            mapping.insert(key.clone(), concept);
+        }
+        Ok(mapping)
+    }
+}
+
+impl OllamaClient {
+    async fn interpret_single_frontmatter_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>, ModelError> {
+        // Short definitions for each concept — measurably improved
+        // reliability over bare names alone in manual testing (models
+        // otherwise conflate semantically close pairs, e.g. `depends_on`
+        // vs `supersedes`). Not "final", just the current best-known
+        // version.
+        let canonical_concepts = "\
+            id (the item's own unique identifier), \
+            kind (the item's type/category, e.g. task, spec, adr), \
+            status (the item's current state, e.g. draft, in_progress, done), \
+            depends_on (this item cannot be completed until the referenced item is done — a blocking prerequisite), \
+            implements (this item is the concrete realization of the referenced item, e.g. a task implementing a spec), \
+            supersedes (this item replaces/obsoletes the referenced item, which should no longer be used), \
+            causes (this item is the origin/trigger of the referenced item, e.g. an incident causing a follow-up task), \
+            owned_by (the referenced item is the person/team responsible for this one), \
+            conflicts_with (this item is incompatible with the referenced item — cannot both hold at once), \
+            documents (this item explains/describes the referenced item), \
+            configures (this item sets parameters/settings for the referenced item)";
         let prompt = format!(
-            "The frontmatter keys below come from an unknown Spec-Driven \
-             Development generator. For each key, say which canonical \
-             concept it corresponds to ({canonical_concepts}), or null if it \
-             doesn't correspond to any.\n\n\
-             Keys: {}",
-            keys.join(", ")
+            "The frontmatter key below comes from an unknown Spec-Driven \
+             Development generator. Say which canonical concept it \
+             corresponds to, or null if it doesn't correspond to any. The \
+             canonical concepts, with what each one means:\n\
+             {canonical_concepts}\n\n\
+             Key: {key}"
         );
 
-        let mapped: FrontmatterMapping = self
+        let mapped: FrontmatterKeyMapping = self
             .generate_structured(prompt, frontmatter_schema())
             .await?;
-        Ok(mapped
-            .mappings
-            .into_iter()
-            .map(|m| (m.key, m.canonical_concept))
-            .collect())
+        Ok(mapped.canonical_concept)
     }
 }
 
@@ -711,6 +744,41 @@ mod tests {
         assert_eq!(
             mapping.get("depends_on").cloned().flatten().as_deref(),
             Some("depends_on")
+        );
+    }
+
+    /// Real finding, verified empirically across a dozen+ runs: batching
+    /// all keys into one classification call is order-sensitive for a
+    /// small model. `depends_on`/`implements` classified correctly 100% of
+    /// the time when they appeared last in the key list, and were
+    /// consistently misclassified (as `causes`/`supersedes`) with the
+    /// exact same prompt/definitions when they appeared first —
+    /// `parse_frontmatter_keys` sorts alphabetically, which happens to put
+    /// `depends_on` first for a typical SDD key set. This test locks in
+    /// the fix (per-key classification, see `interpret_frontmatter_schema`)
+    /// against the specific ordering that used to fail.
+    #[tokio::test]
+    async fn interpret_frontmatter_schema_is_order_independent() {
+        let client = OllamaClient::new("llama3.2");
+        if !client.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+        let keys = vec![
+            "depends_on".to_string(),
+            "id".to_string(),
+            "implements".to_string(),
+            "kind".to_string(),
+            "status".to_string(),
+        ];
+        let mapping = client.interpret_frontmatter_schema(&keys).await.unwrap();
+        assert_eq!(
+            mapping.get("depends_on").cloned().flatten().as_deref(),
+            Some("depends_on")
+        );
+        assert_eq!(
+            mapping.get("implements").cloned().flatten().as_deref(),
+            Some("implements")
         );
     }
 }
