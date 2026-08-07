@@ -1,0 +1,29 @@
+Third-Party Notices
+====================
+
+This file lists third-party assets redistributed inside kern's release
+artifacts, beyond kern's own source (see LICENSE-MIT / LICENSE-APACHE).
+
+Embedding model
+----------------
+Included only in `kern-<target>-with-embedding-model.tar.gz`, as
+`all-MiniLM-L6-v2-ggml-model-f16.gguf`.
+
+- Original model: sentence-transformers/all-MiniLM-L6-v2
+  https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+  License: Apache License 2.0
+- GGUF conversion: second-state/All-MiniLM-L6-v2-Embedding-GGUF
+  https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF
+  License: Apache License 2.0
+- Redistributed unmodified (F16 quantization), under the Apache License
+  2.0 (full text: LICENSE-APACHE in this directory). kern is not
+  affiliated with sentence-transformers or second-state.
+
+llama-server (llama.cpp)
+--------------------------
+Included in every release tarball, embedded inside the `kern` binary and
+extracted to ~/.cache/kern/bin/llama-server/ on first use, alongside its
+own LICENSE-llama-cpp copy.
+
+- https://github.com/ggml-org/llama.cpp — MIT License.
+- Pinned build: see LLAMA_CPP_RELEASE_TAG in .github/workflows/release.yml.

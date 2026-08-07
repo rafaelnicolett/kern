@@ -274,11 +274,13 @@ async fn spawn_embedded_embedder() -> anyhow::Result<LlamaCppRuntime> {
     let binary = embedded::ensure_llama_server_binary().map_err(|e| {
         anyhow::anyhow!("no model backend available: Ollama is not responding on :11434 and {e}")
     })?;
-    let model = embedded::find_cached_model().ok_or_else(|| {
+    let model = embedded::resolve_model()?.ok_or_else(|| {
         anyhow::anyhow!(
             "AGENT_SURFACE.MODEL_MISSING_FROM_CACHE: no .gguf found in \
-             ~/.cache/kern/models — automatic download via Hugging Face Hub is not yet \
-             implemented in this build; populate the cache manually before running without Ollama"
+             ~/.cache/kern/models, and no sidecar .gguf next to the running executable — \
+             download the kern-<target>-with-embedding-model release tarball for a \
+             zero-setup embedded model, or populate ~/.cache/kern/models by hand before \
+             running without Ollama"
         )
     })?;
     let port = pick_free_port()?;

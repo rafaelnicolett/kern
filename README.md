@@ -89,13 +89,28 @@ error instead of guessing:
   `ollama pull llama3.2` for ontology extraction/judging.
 - **Bundled engine, otherwise** — release binaries embed a
   [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`,
-  extracted to `~/.cache/kern/bin/` on first use, no separate install.
-  *Automatic model-weight download is landing soon; until then, place a
-  compatible embedding `.gguf` file under `~/.cache/kern/models/`.*
+  extracted to `~/.cache/kern/bin/` on first use, no separate install. The
+  embedding *weights* still have to come from somewhere:
+  - the **[`kern-<target>-with-embedding-model`](#zero-setup-embeddings-no-ollama)
+    release tarball** ships a real embedding model
+    ([`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2),
+    F16 GGUF, ~46 MB, Apache-2.0 — see
+    [NOTICE-THIRD-PARTY](NOTICE-THIRD-PARTY)) as a file next to the binary,
+    adopted into `~/.cache/kern/models/` the first time it's needed — no
+    manual step.
+  - the plain `kern-<target>` tarball doesn't include a model file — either
+    run Ollama, or place a compatible embedding `.gguf` under
+    `~/.cache/kern/models/` by hand.
+
+This only closes the gap for **embeddings**. Ontology extraction/judging
+has no bundled backend yet — that path still needs Ollama regardless of
+which tarball you use. There is also still no *runtime* automatic download
+from Hugging Face — the with-embedding-model tarball is a build-time
+bundling choice, not download-on-demand.
 
 ## Installing
 
-### From a release (recommended, once available)
+### From a release (recommended)
 
 Pre-built binaries are published on the
 [Releases page](https://github.com/rafaelnicolett/kern/releases) for
@@ -120,6 +135,39 @@ mv kern/kern /usr/local/bin/
 
 > Linux arm64 and Windows aren't built yet — see [Contributing](#contributing)
 > if you'd like to help close that gap.
+
+### Zero-setup embeddings (no Ollama)
+
+`kern-<target>-with-embedding-model.tar.gz` bundles a real embedding model
+alongside the binary — no Ollama, no manual `.gguf` placement:
+
+```bash
+curl -L https://github.com/rafaelnicolett/kern/releases/latest/download/kern-aarch64-apple-darwin-with-embedding-model.tar.gz | tar xz
+```
+
+(same pattern for `x86_64-apple-darwin` and `x86_64-unknown-linux-gnu`)
+
+**Run it once from the extracted folder before moving the binary anywhere.**
+kern looks for a `.gguf` sitting next to its own executable the first time
+it needs the embedded backend, and adopts it into `~/.cache/kern/models/`:
+
+```bash
+cd kern-aarch64-apple-darwin-with-embedding-model
+./kern project create acme --path ./docs/acme
+./kern serve --project acme
+```
+
+After that first run, the model is cached and the binary can be moved onto
+`PATH` like the plain tarball above (`mv kern /usr/local/bin/`) — a
+symlink created *before* that first run does **not** work as a shortcut
+around this (verified: `current_exe()` returns the invoked path, not the
+symlink's target, so a pre-placed symlink can't see the sidecar file
+either). Moving the binary away before the first run strands the model
+file behind and `kern serve` fails with a clear
+`AGENT_SURFACE.MODEL_MISSING_FROM_CACHE` error rather than a confusing one.
+
+This still doesn't cover ontology extraction/judging — that needs Ollama
+either way (see [Model backend](#model-backend)).
 
 ### From source
 
@@ -151,18 +199,21 @@ kern status --project acme
 launched by an MCP host, not run interactively in a terminal you're typing
 into. See below for wiring it up.
 
-Before the first `serve`, resolve a model backend per the
-[Model backend](#model-backend) section above: either `ollama pull
-all-minilm` (and optionally `llama3.2`), or a manually cached `.gguf` for
-the embedded path — `kern serve` has nothing to fall back on otherwise, and
-fails with a clear error rather than hanging.
+Before the first `serve`, resolve a model backend per
+[Model backend](#model-backend): `ollama pull all-minilm` (and optionally
+`llama3.2`), the
+[`kern-<target>-with-embedding-model`](#zero-setup-embeddings-no-ollama)
+release tarball (embeddings only, zero manual steps), or a manually cached
+`.gguf` — `kern serve` has nothing to fall back on otherwise, and fails
+with a clear error rather than hanging.
 
-**v0 target**: once model resolution is fully automatic (no manual `ollama
-pull` or manual `.gguf` placement needed), install-to-useful-`query_ontological`-response
-should take about 2 minutes, dominated by the one-time model download, not
-by setup friction. That's the design target this v0 is built toward — it
-isn't there yet (see [Model backend](#model-backend)), so budget a few extra
-manual minutes today for pulling or placing a model first.
+**v0 target**: install-to-useful-`query_ontological`-response should take
+about 2 minutes. For the **embedding** path, that's met today by the
+with-embedding-model tarball (see
+[BENCHMARKS.md](BENCHMARKS.md#3-time-to-useful-response) for a real
+measurement) — no manual `ollama pull` or `.gguf` placement needed.
+**Ontology extraction/judging** still needs Ollama regardless of tarball;
+that half of the v0 target isn't met yet.
 
 ### Connecting an MCP host
 
@@ -321,7 +372,10 @@ great first contribution.
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
-your option — the Rust ecosystem default.
+your option — the Rust ecosystem default. The
+`kern-<target>-with-embedding-model` release tarball additionally
+redistributes a third-party embedding model — see
+[NOTICE-THIRD-PARTY](NOTICE-THIRD-PARTY) for license and attribution.
 
 ---
 

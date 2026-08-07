@@ -5,10 +5,16 @@
 //! builds don't embed anything and depend only on the Ollama probe (see
 //! `cmd_serve` in `main.rs`).
 //!
-//! The `.gguf` model itself is **not** embedded (model weights are too
-//! large for the binary) — it's resolved separately from the local cache
-//! (`~/.cache/kern/models/`). Automatic download via Hugging Face Hub is
-//! not yet implemented (see sprint-status.md).
+//! The `.gguf` model itself is **not** embedded in the binary (weights are
+//! too large for `include_bytes!`) — it's resolved from the filesystem, in
+//! order: (1) `~/.cache/kern/models/`, the persistent cache
+//! (`find_cached_model`); (2) a `.gguf` shipped as a *sidecar* file next to
+//! the running executable — the shape of the `kern-<target>-with-embedding-model`
+//! release tarball — adopted into the cache on first use (`resolve_model`).
+//! Neither path performs a network call: there is still no automatic
+//! download from Hugging Face Hub (or anywhere else) at runtime; the
+//! with-embedding-model tarball is a build-time bundling decision, not
+//! download-on-demand.
 
 use std::path::PathBuf;
 
@@ -81,14 +87,16 @@ pub fn ensure_llama_server_binary() -> anyhow::Result<PathBuf> {
     )
 }
 
-/// First `.gguf` found in `~/.cache/kern/models/`, alphabetical order —
-/// v0 doesn't pick an "official" default model nor download anything
-/// automatically (see module doc). Fails explicitly if the directory
-/// doesn't exist or is empty; the caller decides the final error message.
-pub fn find_cached_model() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let models_dir = home.join(".cache").join("kern").join("models");
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&models_dir)
+/// Shared home for the persistent model cache — `~/.cache/kern/models/`.
+fn models_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".cache").join("kern").join("models"))
+}
+
+/// First `.gguf` in `dir`, alphabetical order — no "official" default,
+/// first wins. Shared by the persistent-cache lookup and the sidecar
+/// lookup below.
+fn first_gguf_in(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
@@ -96,6 +104,73 @@ pub fn find_cached_model() -> Option<PathBuf> {
         .collect();
     candidates.sort();
     candidates.into_iter().next()
+}
+
+/// First `.gguf` found in `~/.cache/kern/models/`, alphabetical order —
+/// v0 doesn't pick an "official" default model nor download anything
+/// automatically (see module doc). Fails explicitly if the directory
+/// doesn't exist or is empty; the caller decides the final error message.
+pub fn find_cached_model() -> Option<PathBuf> {
+    first_gguf_in(&models_dir()?)
+}
+
+/// A `.gguf` shipped as a *sidecar* file next to the running executable —
+/// the shape of the `kern-<target>-with-embedding-model` release tarball
+/// (binary + model file, extracted side by side). Uses `current_exe()`,
+/// not a compile-time path — the binary is byte-identical between tarball
+/// variants, only packaging differs. `Ok(None)` is a normal state (slim
+/// tarball, dev build), not an error.
+fn sidecar_model() -> anyhow::Result<Option<PathBuf>> {
+    let exe = std::env::current_exe()?;
+    Ok(exe.parent().and_then(first_gguf_in))
+}
+
+/// Copies `source` into `models_dir` if it isn't already there — idempotent,
+/// mirrors `ensure_extracted_at`'s pattern for the llama-server binary.
+/// Only ever called once a real sidecar file has already been found on
+/// local disk: no network call, nothing fabricated.
+fn adopt_into_model_cache(
+    source: &std::path::Path,
+    models_dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(models_dir)?;
+    let file_name = source.file_name().ok_or_else(|| {
+        anyhow::anyhow!("sidecar model path has no file name: {}", source.display())
+    })?;
+    let dest = models_dir.join(file_name);
+    if !dest.exists() {
+        std::fs::copy(source, &dest)?;
+        tracing::info!(
+            source = %source.display(),
+            dest = %dest.display(),
+            "adopted sidecar embedding model into ~/.cache/kern/models"
+        );
+    }
+    Ok(dest)
+}
+
+/// Full model resolution order used by `spawn_embedded_embedder` (main.rs):
+/// (1) `~/.cache/kern/models/` — unchanged, works today; (2) a sidecar
+/// `.gguf` next to the running executable — the with-embedding-model
+/// tarball's shape — adopted into the same cache so it behaves identically
+/// to a manually-placed file from this point on, including on a later run
+/// after the binary has moved away from its sidecar. `Ok(None)` only when
+/// neither source has a model; the caller decides the final error message.
+/// Real filesystem errors (e.g. an unwritable cache dir) surface as `Err`,
+/// never silently collapsed into `None` — that would misreport a
+/// permissions failure as "no model available".
+pub fn resolve_model() -> anyhow::Result<Option<PathBuf>> {
+    if let Some(cached) = find_cached_model() {
+        return Ok(Some(cached));
+    }
+    match sidecar_model()? {
+        Some(sidecar) => {
+            let dir = models_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not resolve the home directory"))?;
+            Ok(Some(adopt_into_model_cache(&sidecar, &dir)?))
+        }
+        None => Ok(None),
+    }
 }
 
 #[cfg(all(test, feature = "bundled-llama-server"))]
@@ -118,5 +193,57 @@ mod tests {
         let second = ensure_extracted_at(&cache_dir).expect("second call should be idempotent");
         let modified_after = std::fs::metadata(&second).unwrap().modified().unwrap();
         assert_eq!(modified_before, modified_after, "should not re-extract");
+    }
+}
+
+// Not feature-gated — plain filesystem I/O, no dependency on the
+// `include_bytes!`'d llama-server archive, so this runs under the default
+// `cargo test --workspace`.
+#[cfg(test)]
+mod sidecar_model_tests {
+    use super::*;
+
+    #[test]
+    fn first_gguf_in_picks_the_alphabetically_first_gguf_and_ignores_other_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("readme.txt"), b"not a model").unwrap();
+        std::fs::write(tmp.path().join("zeta.gguf"), b"zeta").unwrap();
+        std::fs::write(tmp.path().join("alpha.gguf"), b"alpha").unwrap();
+
+        let found = first_gguf_in(tmp.path()).expect("should find a .gguf");
+        assert_eq!(found.file_name().unwrap(), "alpha.gguf");
+    }
+
+    #[test]
+    fn first_gguf_in_returns_none_for_an_empty_or_missing_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(first_gguf_in(tmp.path()).is_none());
+        assert!(first_gguf_in(&tmp.path().join("does-not-exist")).is_none());
+    }
+
+    #[test]
+    fn adopt_into_model_cache_copies_the_file_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_dir = tmp.path().join("sidecar");
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("model.gguf");
+        std::fs::write(&source, b"fake model bytes").unwrap();
+
+        let first = adopt_into_model_cache(&source, &cache_dir).expect("first copy should work");
+        assert!(first.exists());
+        assert_eq!(std::fs::read(&first).unwrap(), b"fake model bytes");
+
+        // Idempotency: mutate the cached copy, then adopt again — a real
+        // copy would clobber our mutation, so surviving it proves the
+        // second call short-circuited on `dest.exists()`.
+        std::fs::write(&first, b"mutated after first adopt").unwrap();
+        let second =
+            adopt_into_model_cache(&source, &cache_dir).expect("second call should be idempotent");
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            b"mutated after first adopt"
+        );
     }
 }

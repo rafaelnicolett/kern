@@ -12,6 +12,15 @@ env:
   # rust-toolchain.toml). Bumping this is a deliberate decision, tested
   # manually before the bump.
   LLAMA_CPP_RELEASE_TAG: b10298
+  # Embedding model bundled into the kern-<target>-with-embedding-model
+  # tarball — same "never a loose latest" discipline: pinned to the exact
+  # HF repo revision and file hash that were verified end-to-end (loaded
+  # into llama-server --embedding, produced a real 384-dim embedding via
+  # /v1/embeddings) before this was wired into CI. Apache-2.0, see
+  # NOTICE-THIRD-PARTY.
+  EMBEDDING_MODEL_REVISION: 544f204f2eaa2d71361ffc74d6df7170285b286a
+  EMBEDDING_MODEL_FILE: all-MiniLM-L6-v2-ggml-model-f16.gguf
+  EMBEDDING_MODEL_SHA256: 797b70c4edf85907fe0a49eb85811256f65fa0f7bf52166b147fd16be2be4662
 
 jobs:
   build:
@@ -88,6 +97,15 @@ jobs:
           tar czf /tmp/llama-server-bundle.tar.gz -C "$bundle" .
           ls -lh /tmp/llama-server-bundle.tar.gz
 
+      - name: Download the bundled embedding model (all-MiniLM-L6-v2, F16 GGUF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/${EMBEDDING_MODEL_REVISION}/${EMBEDDING_MODEL_FILE}"
+          echo "downloading ${url}"
+          curl -sL --fail -o "/tmp/${EMBEDDING_MODEL_FILE}" "${url}"
+          echo "${EMBEDDING_MODEL_SHA256}  /tmp/${EMBEDDING_MODEL_FILE}" | shasum -a 256 -c -
+
       - name: cargo build --release (with llama-server bundled in)
         env:
           KERN_LLAMA_SERVER_ARCHIVE: /tmp/llama-server-bundle.tar.gz
@@ -111,6 +129,30 @@ jobs:
         with:
           name: kern-${{ matrix.target }}
           path: kern-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+      # Same compiled binary as above, packaged a second time alongside a
+      # real embedding model — zero-setup path, no Ollama and no manual
+      # .gguf placement needed (see kern-cli/src/embedded.rs::resolve_model).
+      # Deliberately not named "offline"/"standalone": ontology
+      # extraction/judging still needs Ollama either way.
+      - name: Package the artifact (with bundled embedding model)
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=kern-${{ matrix.target }}-with-embedding-model
+          mkdir -p "$out"
+          bin="target/${{ matrix.target }}/release/kern"
+          [ -f "$bin" ] || bin="target/${{ matrix.target }}/release/kern.exe"
+          cp "$bin" "$out"/
+          cp README.md LICENSE-MIT LICENSE-APACHE NOTICE-THIRD-PARTY "$out"/
+          cp "/tmp/${EMBEDDING_MODEL_FILE}" "$out"/
+          tar czf "$out.tar.gz" "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kern-${{ matrix.target }}-with-embedding-model
+          path: kern-${{ matrix.target }}-with-embedding-model.tar.gz
           if-no-files-found: error
 
   # Only runs on a tag push (`v*`) — workflow_dispatch exists to test the
