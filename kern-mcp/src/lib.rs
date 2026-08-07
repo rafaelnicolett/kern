@@ -1,6 +1,6 @@
-//! kern-mcp — servidor MCP (stdio, via `rmcp`) + as 6 tools da superfície de
-//! agente. Contrato: docs/architecture/mcp-tool-contract.md (workspace de
-//! delivery) — substitui OpenAPI, kern não expõe REST no v0 (docs/adr/0007).
+//! kern-mcp — MCP server (stdio, via `rmcp`) + the 6 tools of the agent
+//! surface. Contract: docs/architecture/mcp-tool-contract.md — replaces
+//! OpenAPI, kern does not expose REST in v0 (docs/adr/0007).
 
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------
-// Schemas — espelham docs/architecture/mcp-tool-contract.md
+// Schemas — mirror docs/architecture/mcp-tool-contract.md
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -151,7 +151,7 @@ pub struct QueryOntologicalOutput {
 }
 
 // ---------------------------------------------------------------------
-// Servidor
+// Server
 // ---------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -180,7 +180,7 @@ impl KernServer {
         }
     }
 
-    #[tool(description = "Busca chunks por similaridade vetorial + keyword boost")]
+    #[tool(description = "Search chunks by vector similarity + keyword boost")]
     async fn search_hybrid(
         &self,
         params: Parameters<SearchHybridInput>,
@@ -194,7 +194,7 @@ impl KernServer {
         let top_k = input.top_k.unwrap_or(10) as usize;
         let results = self
             .vector_store
-            .search_hybrid(&embedding, top_k)
+            .search_hybrid(&embedding, &input.query, top_k)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -211,7 +211,9 @@ impl KernServer {
         }))
     }
 
-    #[tool(description = "Busca entidade por nome/descrição (conceito) + suas relações diretas")]
+    #[tool(
+        description = "Search for an entity by name/description (concept) + its direct relations"
+    )]
     async fn query_by_concept(
         &self,
         params: Parameters<QueryByConceptInput>,
@@ -222,9 +224,10 @@ impl KernServer {
             .find_entities_by_name(&concept)
             .await
             .map_err(|e| e.to_string())?;
-        let entity = matches.into_iter().next().ok_or_else(|| {
-            format!("ONTOLOGIA.CONCEITO_NAO_ENCONTRADO: nenhuma entidade casa com '{concept}'")
-        })?;
+        let entity = matches
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("ONTOLOGY.CONCEPT_NOT_FOUND: no entity matches '{concept}'"))?;
 
         let relations = self
             .instances
@@ -250,14 +253,14 @@ impl KernServer {
         }))
     }
 
-    #[tool(description = "Subgrafo local a partir de uma entidade, até a profundidade solicitada")]
+    #[tool(description = "Local subgraph starting from an entity, up to the requested depth")]
     async fn get_related_entities(
         &self,
         params: Parameters<GetRelatedEntitiesInput>,
     ) -> Result<Json<GetRelatedEntitiesOutput>, String> {
         let input = params.0;
         let entity_id = Uuid::parse_str(&input.entity_id)
-            .map_err(|_| format!("id de entidade inválido: {}", input.entity_id))?;
+            .map_err(|_| format!("invalid entity id: {}", input.entity_id))?;
         let depth = input.depth.unwrap_or(1);
 
         let related = self
@@ -280,7 +283,7 @@ impl KernServer {
         }))
     }
 
-    #[tool(description = "Lista os tipos de entidade e relação existentes, com contagens")]
+    #[tool(description = "List existing entity and relation types, with counts")]
     async fn get_ontology_schema(&self) -> Result<Json<GetOntologySchemaOutput>, String> {
         let entity_types = self
             .types
@@ -315,23 +318,23 @@ impl KernServer {
         }))
     }
 
-    #[tool(description = "Caminho de relações entre duas entidades, com evidência")]
+    #[tool(description = "Path of relations between two entities, with evidence")]
     async fn explain_relation(
         &self,
         params: Parameters<ExplainRelationInput>,
     ) -> Result<Json<ExplainRelationOutput>, String> {
         let input = params.0;
         let a = Uuid::parse_str(&input.entity_id_a)
-            .map_err(|_| format!("id de entidade inválido: {}", input.entity_id_a))?;
+            .map_err(|_| format!("invalid entity id: {}", input.entity_id_a))?;
         let b = Uuid::parse_str(&input.entity_id_b)
-            .map_err(|_| format!("id de entidade inválido: {}", input.entity_id_b))?;
+            .map_err(|_| format!("invalid entity id: {}", input.entity_id_b))?;
 
         let path = self
             .instances
             .find_path(a, b, 6)
             .await
             .map_err(|e| e.to_string())?
-            .ok_or("ONTOLOGIA.CAMINHO_NAO_ENCONTRADO")?;
+            .ok_or("ONTOLOGY.PATH_NOT_FOUND")?;
 
         Ok(Json(ExplainRelationOutput {
             path: path
@@ -347,7 +350,7 @@ impl KernServer {
     }
 
     #[tool(
-        description = "Pergunta em linguagem natural: roteia por tipo de relação com evidência, ou cai em busca vetorial"
+        description = "Natural language question: routes by relation type with evidence, or falls back to vector search"
     )]
     async fn query_ontological(
         &self,
@@ -366,9 +369,10 @@ impl KernServer {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Roteamento semântico: casa a pergunta contra as descrições
-        // canônicas dos tipos de relação antes de cair em busca vetorial
-        // (docs/architecture — "A ontologia participa da consulta").
+        // Semantic routing: matches the question against the canonical
+        // descriptions of relation types before falling back to vector
+        // search (docs/architecture — "The ontology participates in the
+        // query").
         const ROUTING_THRESHOLD: f32 = 0.3;
         let mut best: Option<(kern_ontology::RelationTypeRecord, f32)> = None;
         for rt in relation_types {
@@ -383,9 +387,9 @@ impl KernServer {
             }
         }
 
-        // Tenta achar uma entidade mencionada na pergunta — heurística
-        // simples de v0: procura cada palavra/token relevante como
-        // substring de nome de entidade.
+        // Try to find an entity mentioned in the question — simple v0
+        // heuristic: checks each relevant word/token as a substring of
+        // an entity name.
         let mentioned_entity = {
             let mut found = None;
             for word in question.split_whitespace() {
@@ -422,13 +426,13 @@ impl KernServer {
                         .iter()
                         .map(|r| EvidenceDto {
                             chunk_id: r.evidence_chunk_id.to_string(),
-                            excerpt: "ver chunk de evidência via search_hybrid".to_string(),
+                            excerpt: "see evidence chunk via search_hybrid".to_string(),
                         })
                         .collect();
                     return Ok(Json(QueryOntologicalOutput {
                         mode: "graph_traversal".to_string(),
                         answer: format!(
-                            "{} tem {} relação(ões) do tipo '{}'",
+                            "{} has {} relation(s) of type '{}'",
                             entity.canonical_name,
                             relations.len(),
                             relation_type.name
@@ -439,11 +443,11 @@ impl KernServer {
             }
         }
 
-        // Fallback: nenhum tipo de relação bateu (ou não achou entidade
-        // mencionada) — cai em busca vetorial.
+        // Fallback: no relation type matched (or no mentioned entity was
+        // found) — falls back to vector search.
         let chunks = self
             .vector_store
-            .search_hybrid(&question_embedding, 3)
+            .search_hybrid(&question_embedding, &question, 3)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -452,7 +456,7 @@ impl KernServer {
             answer: chunks
                 .first()
                 .map(|c| c.chunk.content.clone())
-                .unwrap_or_else(|| "nenhum resultado encontrado".to_string()),
+                .unwrap_or_else(|| "no results found".to_string()),
             evidence: chunks
                 .into_iter()
                 .map(|c| EvidenceDto {
@@ -490,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_ontology_schema_lista_tipos_semeados() {
+    async fn get_ontology_schema_lists_seeded_types() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, _) = server(dir.path()).await;
         srv.types.seed_canonical_vocabulary().await.unwrap();
@@ -507,13 +511,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_by_concept_encontra_entidade_e_relacoes_diretas() {
+    async fn query_by_concept_finds_entity_and_direct_relations() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, _) = server(dir.path()).await;
 
         let entity_type = srv
             .types
-            .find_or_create_entity_type("Crate", "um crate")
+            .find_or_create_entity_type("Crate", "a crate")
             .await
             .unwrap();
         let a = srv
@@ -550,30 +554,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_by_concept_retorna_erro_para_conceito_inexistente() {
+    async fn query_by_concept_returns_error_for_nonexistent_concept() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, _) = server(dir.path()).await;
 
         let result = srv
             .query_by_concept(Parameters(QueryByConceptInput {
-                concept: "nao-existe".to_string(),
+                concept: "does-not-exist".to_string(),
             }))
             .await;
 
         match result {
-            Err(msg) => assert!(msg.contains("CONCEITO_NAO_ENCONTRADO")),
-            Ok(_) => panic!("esperava erro CONCEITO_NAO_ENCONTRADO"),
+            Err(msg) => assert!(msg.contains("CONCEPT_NOT_FOUND")),
+            Ok(_) => panic!("expected CONCEPT_NOT_FOUND error"),
         }
     }
 
     #[tokio::test]
-    async fn explain_relation_retorna_caminho_com_evidencia() {
+    async fn explain_relation_returns_path_with_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, _) = server(dir.path()).await;
 
         let entity_type = srv
             .types
-            .find_or_create_entity_type("Crate", "um crate")
+            .find_or_create_entity_type("Crate", "a crate")
             .await
             .unwrap();
         let a = srv
@@ -609,26 +613,23 @@ mod tests {
         assert_eq!(output.path.len(), 1);
     }
 
-    /// Integração real: embed via Ollama (all-minilm) + índice LanceDB real.
+    /// Real integration: embed via Ollama (all-minilm) + real LanceDB index.
     #[tokio::test]
-    async fn search_hybrid_via_ollama_e_lancedb_reais() {
+    async fn search_hybrid_via_real_ollama_and_lancedb() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, embedder) = server(dir.path()).await;
 
         if !OllamaClient::new("all-minilm").probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
-        let embedding = embedder
-            .embed("motor de ontologia incremental")
-            .await
-            .unwrap();
+        let embedding = embedder.embed("incremental ontology engine").await.unwrap();
         srv.vector_store
             .upsert(ChunkRecord {
                 id: Uuid::new_v4(),
-                file_path: "docs/ontologia.md".to_string(),
-                content: "O motor de ontologia decide merge, novo tipo ou judge.".to_string(),
+                file_path: "docs/ontology.md".to_string(),
+                content: "The ontology engine decides merge, new type, or judge.".to_string(),
                 embedding,
                 content_hash: "hash-1".to_string(),
                 updated_at: "2026-08-06T00:00:00Z".to_string(),
@@ -638,24 +639,24 @@ mod tests {
 
         let Json(output) = srv
             .search_hybrid(Parameters(SearchHybridInput {
-                query: "motor de ontologia".to_string(),
+                query: "ontology engine".to_string(),
                 top_k: Some(5),
             }))
             .await
             .unwrap();
 
         assert!(!output.chunks.is_empty());
-        assert!(output.chunks[0].content.contains("motor de ontologia"));
+        assert!(output.chunks[0].content.contains("ontology engine"));
     }
 
     #[tokio::test]
-    async fn get_related_entities_respeita_profundidade() {
+    async fn get_related_entities_respects_depth() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, _) = server(dir.path()).await;
 
         let entity_type = srv
             .types
-            .find_or_create_entity_type("Crate", "um crate")
+            .find_or_create_entity_type("Crate", "a crate")
             .await
             .unwrap();
         let a = srv
@@ -716,16 +717,16 @@ mod tests {
         assert_eq!(depth2.subgraph.entities.len(), 2);
     }
 
-    /// Integração real contra Ollama+LanceDB: consulta que casa com um tipo
-    /// de relação canônico e menciona uma entidade existente deveria
-    /// rotear por travessia de grafo, não cair no fallback vetorial.
+    /// Real integration against Ollama+LanceDB: a query that matches a
+    /// canonical relation type and mentions an existing entity should
+    /// route via graph traversal, not fall back to vector search.
     #[tokio::test]
-    async fn query_ontological_roteia_por_tipo_quando_ha_match_forte() {
+    async fn query_ontological_routes_by_type_when_strong_match() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, _) = server(dir.path()).await;
 
         if !OllamaClient::new("all-minilm").probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
@@ -738,7 +739,7 @@ mod tests {
             .unwrap();
         let entity_type = srv
             .types
-            .find_or_create_entity_type("Crate", "um crate")
+            .find_or_create_entity_type("Crate", "a crate")
             .await
             .unwrap();
         let kernmcp = srv
@@ -765,7 +766,7 @@ mod tests {
 
         let Json(output) = srv
             .query_ontological(Parameters(QueryOntologicalInput {
-                question: "o que kernmcpxyz depends_on?".to_string(),
+                question: "what is the depends_on type for kernmcpxyz?".to_string(),
             }))
             .await
             .unwrap();
@@ -775,24 +776,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_ontological_cai_em_fallback_vetorial_sem_match() {
+    async fn query_ontological_falls_back_to_vector_search_without_match() {
         let dir = tempfile::tempdir().unwrap();
         let (srv, embedder) = server(dir.path()).await;
 
         if !OllamaClient::new("all-minilm").probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
         let embedding = embedder
-            .embed("conteúdo qualquer sobre o projeto")
+            .embed("some random content about the project")
             .await
             .unwrap();
         srv.vector_store
             .upsert(ChunkRecord {
                 id: Uuid::new_v4(),
                 file_path: "docs/x.md".to_string(),
-                content: "conteúdo qualquer sobre o projeto".to_string(),
+                content: "some random content about the project".to_string(),
                 embedding,
                 content_hash: "hash-x".to_string(),
                 updated_at: "2026-08-06T00:00:00Z".to_string(),
@@ -802,7 +803,7 @@ mod tests {
 
         let Json(output) = srv
             .query_ontological(Parameters(QueryOntologicalInput {
-                question: "pergunta sem nenhuma entidade conhecida mencionada".to_string(),
+                question: "a question that doesn't mention any known entity".to_string(),
             }))
             .await
             .unwrap();

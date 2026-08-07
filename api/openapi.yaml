@@ -1,0 +1,20 @@
+# kern exposes no REST API in v0.
+#
+# The real v0 surface contract is MCP over stdio (6 tools) + the CLI — not
+# HTTP. Optional local HTTP is explicitly a "later" item, and only enters
+# scope in a future iteration.
+#
+# The real contract (the contract-first equivalent of OpenAPI, adapted to
+# MCP): docs/architecture/mcp-tool-contract.md
+#
+# This file stays as an honest placeholder — it documents no endpoints that
+# don't exist — so tooling that expects api/openapi.yaml to be present
+# doesn't break.
+openapi: "3.1.0"
+info:
+  title: kern (no REST in v0)
+  version: "0.0.0"
+  description: |
+    No REST endpoint exists in v0. See docs/architecture/mcp-tool-contract.md
+    for the real contract (MCP over stdio + CLI).
+paths: {}

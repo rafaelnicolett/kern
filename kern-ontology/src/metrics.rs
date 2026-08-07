@@ -1,6 +1,5 @@
-//! Taxa de fallback para o `judge()` — KPI North Star do projeto
-//! (business-brief.md, workspace de delivery). Exposta como métrica
-//! consultável, não só logada (docs/adr/0005).
+//! Fallback rate for `judge()` — the project's North Star KPI. Exposed as
+//! a queryable metric, not just logged.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,8 +14,9 @@ impl FallbackMetrics {
         Self::default()
     }
 
-    /// Registra um candidato processado — `was_fallback` é `true` só quando
-    /// o candidato caiu na zona ambígua e `judge()` foi chamado.
+    /// Records a processed candidate — `was_fallback` is `true` only when
+    /// the candidate fell into the ambiguous zone and `judge()` was
+    /// called.
     pub fn record(&self, was_fallback: bool) {
         self.total.fetch_add(1, Ordering::Relaxed);
         if was_fallback {
@@ -28,7 +28,7 @@ impl FallbackMetrics {
             total = self.total.load(Ordering::Relaxed),
             fallback_total = self.fallback.load(Ordering::Relaxed),
             rate = self.fallback_rate(),
-            "candidato processado"
+            "candidate processed"
         );
     }
 
@@ -40,7 +40,7 @@ impl FallbackMetrics {
         self.fallback.load(Ordering::Relaxed)
     }
 
-    /// `0.0` se nada foi processado ainda — nunca `NaN`.
+    /// `0.0` if nothing has been processed yet — never `NaN`.
     pub fn fallback_rate(&self) -> f64 {
         let total = self.total.load(Ordering::Relaxed);
         if total == 0 {
@@ -55,14 +55,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn taxa_comeca_em_zero_sem_processar_nada() {
+    fn rate_starts_at_zero_without_processing_anything() {
         let m = FallbackMetrics::new();
         assert_eq!(m.fallback_rate(), 0.0);
         assert_eq!(m.total(), 0);
     }
 
     #[test]
-    fn taxa_reflete_proporcao_de_fallback() {
+    fn rate_reflects_the_fallback_proportion() {
         let m = FallbackMetrics::new();
         m.record(false);
         m.record(false);

@@ -1,6 +1,6 @@
-//! Integração real: spawna o binário `kern` compilado como subprocesso —
-//! não chama funções internas. `KERN_HOME` isola o registry global de
-//! projetos entre execuções de teste paralelas.
+//! Real integration: spawns the compiled `kern` binary as a subprocess —
+//! does not call internal functions directly. `KERN_HOME` isolates the
+//! global project registry across parallel test runs.
 
 use std::path::Path;
 use std::process::Command;
@@ -12,14 +12,10 @@ fn kern_cmd(kern_home: &Path) -> Command {
 }
 
 #[test]
-fn project_create_e_status_funcionam_fim_a_fim() {
+fn project_create_and_status_work_end_to_end() {
     let kern_home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        project_dir.path().join("doc.md"),
-        "# Título\nconteúdo de teste\n",
-    )
-    .unwrap();
+    std::fs::write(project_dir.path().join("doc.md"), "# Title\ntest content\n").unwrap();
 
     let create = kern_cmd(kern_home.path())
         .args([
@@ -38,7 +34,7 @@ fn project_create_e_status_funcionam_fim_a_fim() {
     );
     assert!(String::from_utf8_lossy(&create.stdout).contains("acme"));
 
-    // .kern/ foi criado com registro + vetores.
+    // .kern/ was created with registry + vectors.
     assert!(project_dir
         .path()
         .join(".kern")
@@ -53,13 +49,13 @@ fn project_create_e_status_funcionam_fim_a_fim() {
     assert!(status.status.success());
     let status_out = String::from_utf8_lossy(&status.stdout);
     assert!(status_out.contains("acme"));
-    // 8 tipos canônicos semeados na criação, 0 chunks (ainda sem `serve`).
-    assert!(status_out.contains("8 canônicos"));
-    assert!(status_out.contains("chunks indexados: 0"));
+    // 8 canonical types seeded on creation, 0 chunks (no `serve` yet).
+    assert!(status_out.contains("8 canonical"));
+    assert!(status_out.contains("chunks indexed: 0"));
 }
 
 #[test]
-fn project_create_com_nome_ja_existente_falha() {
+fn project_create_with_existing_name_fails() {
     let kern_home = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
 
@@ -86,11 +82,11 @@ fn project_create_com_nome_ja_existente_falha() {
         .output()
         .unwrap();
     assert!(!second.status.success());
-    assert!(String::from_utf8_lossy(&second.stderr).contains("PROJETO_JA_EXISTE"));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("PROJECT_ALREADY_EXISTS"));
 }
 
 #[test]
-fn status_de_projeto_inexistente_falha_com_mensagem_clara() {
+fn status_of_nonexistent_project_fails_with_clear_message() {
     let kern_home = tempfile::tempdir().unwrap();
 
     let status = kern_cmd(kern_home.path())
@@ -99,16 +95,16 @@ fn status_de_projeto_inexistente_falha_com_mensagem_clara() {
         .unwrap();
 
     assert!(!status.status.success());
-    assert!(String::from_utf8_lossy(&status.stderr).contains("PROJETO_NAO_ENCONTRADO"));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("PROJECT_NOT_FOUND"));
 }
 
 #[test]
-fn status_sem_projeto_lista_registrados() {
+fn status_without_project_lists_registered() {
     let kern_home = tempfile::tempdir().unwrap();
 
     let empty = kern_cmd(kern_home.path()).arg("status").output().unwrap();
     assert!(empty.status.success());
-    assert!(String::from_utf8_lossy(&empty.stdout).contains("nenhum projeto"));
+    assert!(String::from_utf8_lossy(&empty.stdout).contains("no project created"));
 
     let project_dir = tempfile::tempdir().unwrap();
     kern_cmd(kern_home.path())

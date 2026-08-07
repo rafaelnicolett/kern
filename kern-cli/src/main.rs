@@ -1,8 +1,8 @@
-//! kern-cli — binario final: `project create`, `serve`, `status`.
+//! kern-cli — the final binary: `project create`, `serve`, `status`.
 //!
-//! Unico runtime: o mesmo binario observa, converte, extrai, indexa e serve.
-//! Ver docs/domain/superficie-de-agente/aggregates.md (workspace de
-//! delivery) para a maquina de estados do processo (KernProcess).
+//! Single runtime: the same binary watches, converts, extracts, indexes, and
+//! serves. See the KernProcess state machine below (design rationale kept in
+//! the maintainer's private delivery workspace, not published in this repo).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,18 +11,19 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use kern_ingest::{MarkdownChunker, StructuralMarkdownChunker};
 use kern_mcp::KernServer;
-use kern_model::{EmbeddingProvider, LlamaCppRuntime, OllamaClient};
+use kern_model::{EmbeddingProvider, ExtractionProvider, LlamaCppRuntime, OllamaClient};
 use kern_ontology::{
-    SqliteFrontmatterProfileRepository, SqliteInstanceRepository, SqliteTypeRepository,
-    TypeRepository,
+    AmbiguousZoneConfig, OntologyEngine, SqliteFrontmatterProfileRepository,
+    SqliteInstanceRepository, SqliteTypeRepository, TypeRepository,
 };
 use kern_vector::{ChunkRecord, LanceVectorStore, VectorStore};
 use tracing_subscriber::EnvFilter;
 
 mod embedded;
 
-/// Estados do KernProcess — transicoes estritamente sequenciais, sem
-/// retrocesso (docs/domain/superficie-de-agente/aggregates.md).
+/// KernProcess states — strictly sequential transitions, no going back
+/// (design rationale kept in the maintainer's private delivery workspace,
+/// not published in this repo).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessState {
     Starting,
@@ -33,7 +34,7 @@ enum ProcessState {
 }
 
 #[derive(Parser)]
-#[command(name = "kern", version, about = "RAG local + ontologia incremental")]
+#[command(name = "kern", version, about = "local RAG + incremental ontology")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,20 +42,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Gerencia projetos isolados (pasta + estado próprio).
+    /// Manages isolated projects (folder + own state).
     Project {
         #[command(subcommand)]
         action: ProjectAction,
     },
-    /// Sobe o processo: CatchUpScan seguido de servidor MCP stdio.
+    /// Starts the process: CatchUpScan followed by the MCP stdio server.
     Serve {
         #[arg(long)]
         project: String,
     },
-    /// Reporta saúde do projeto — funciona mesmo sem um `serve` rodando,
-    /// lendo o estado persistido (v0 é single-client, sem coordenação
-    /// multi-processo — métricas em memória de uma sessão `serve` corrente
-    /// não são visíveis aqui, só o que já foi persistido).
+    /// Reports project health — works even without a `serve` running, by
+    /// reading persisted state (v0 is single-client, with no multi-process
+    /// coordination — in-memory metrics from a currently running `serve`
+    /// session are not visible here, only what has already been persisted).
     Status {
         #[arg(long)]
         project: Option<String>,
@@ -63,7 +64,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ProjectAction {
-    /// Cria um projeto isolado — nome único na máquina local.
+    /// Creates an isolated project — name must be unique on the local machine.
     Create {
         name: String,
         #[arg(long)]
@@ -72,13 +73,13 @@ enum ProjectAction {
 }
 
 fn registry_path() -> anyhow::Result<PathBuf> {
-    // KERN_HOME sobrepõe o diretório home — usado por testes de integração
-    // pra isolar o registry global entre execuções paralelas.
+    // KERN_HOME overrides the home directory — used by integration tests
+    // to isolate the global registry across parallel runs.
     if let Ok(override_home) = std::env::var("KERN_HOME") {
         return Ok(PathBuf::from(override_home).join("projects.json"));
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("não foi possível resolver o diretório home"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve the home directory"))?;
     Ok(home.join(".kern").join("projects.json"))
 }
 
@@ -102,16 +103,18 @@ fn save_registry(registry: &HashMap<String, PathBuf>) -> anyhow::Result<()> {
 
 async fn cmd_project_create(name: String, path: PathBuf) -> anyhow::Result<()> {
     let mut registry = load_registry()?;
-    // Nome único no escopo da máquina local (docs/domain/superficie-de-agente/aggregates.md).
+    // Name must be unique within the local machine scope (design rationale
+    // kept in the maintainer's private delivery workspace, not published in
+    // this repo).
     if registry.contains_key(&name) {
-        anyhow::bail!("SUPERFICIE_DE_AGENTE.PROJETO_JA_EXISTE: '{name}' já existe");
+        anyhow::bail!("AGENT_SURFACE.PROJECT_ALREADY_EXISTS: '{name}' already exists");
     }
 
     std::fs::create_dir_all(path.join(".kern"))?;
     let db_path = path.join(".kern").join("registry.db");
 
-    // Um TypeRegistry + um InstanceGraph próprios — nunca compartilhados
-    // entre projetos.
+    // Each project gets its own TypeRegistry + InstanceGraph — never shared
+    // across projects.
     let types = SqliteTypeRepository::open(&db_path)?;
     types.seed_canonical_vocabulary().await?;
     let _instances = SqliteInstanceRepository::open(&db_path)?;
@@ -121,7 +124,7 @@ async fn cmd_project_create(name: String, path: PathBuf) -> anyhow::Result<()> {
     registry.insert(name.clone(), path.clone());
     save_registry(&registry)?;
 
-    println!("projeto '{name}' criado em {}", path.display());
+    println!("project '{name}' created at {}", path.display());
     Ok(())
 }
 
@@ -130,18 +133,24 @@ fn resolve_project(name: &str) -> anyhow::Result<PathBuf> {
     registry
         .get(name)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("SUPERFICIE_DE_AGENTE.PROJETO_NAO_ENCONTRADO: '{name}'"))
+        .ok_or_else(|| anyhow::anyhow!("AGENT_SURFACE.PROJECT_NOT_FOUND: '{name}'"))
 }
 
-/// CatchUpScan — reusa o mesmo hash-diff do watcher pra recuperar atraso
-/// (docs/domain/superficie-de-agente/aggregates.md). Só cobre chunk+embed+
-/// index (kern-ontology precisa de conteúdo estruturado — extração de
-/// entidades/relações fica pra quando o corpus tiver frontmatter real,
-/// não é bloqueante pro critério de aceite do v0).
+/// CatchUpScan — reuses the same hash-diff as the watcher to recover from
+/// lag (design rationale kept in the maintainer's private delivery
+/// workspace, not published in this repo). Chunk+embed+index always
+/// happens; ontology enrichment (extract+judge per chunk, see
+/// docs/architecture/sequences/seq-ingestao-e-ontologia.drawio) only
+/// happens when `ontology_engine` is `Some` — it is `None` when Ollama is
+/// not available (the embedded backend only covers embedding, see
+/// `spawn_embedded_embedder`). An isolated enrichment failure on one chunk
+/// never aborts the vector indexing of the others — it's an enhancement,
+/// not a requirement for the chunk to become searchable.
 async fn catch_up_scan(
     root: &Path,
     vector_store: &dyn VectorStore,
     embedder: &dyn EmbeddingProvider,
+    ontology_engine: Option<&OntologyEngine>,
 ) -> anyhow::Result<usize> {
     let chunker = StructuralMarkdownChunker;
     let mut indexed = 0usize;
@@ -151,10 +160,22 @@ async fn catch_up_scan(
         let chunks = chunker.chunk(&entry, &content);
         for chunk in chunks {
             let embedding = embedder.embed(&chunk.content).await?;
+            let file_path = chunk.file_path.to_string_lossy().to_string();
+
+            if let Some(engine) = ontology_engine {
+                if let Err(e) = engine.process_chunk(&chunk.content, &file_path).await {
+                    tracing::warn!(
+                        error = %e,
+                        file = %file_path,
+                        "failed to enrich ontology for this chunk — vector indexing is not affected"
+                    );
+                }
+            }
+
             vector_store
                 .upsert(ChunkRecord {
                     id: chunk.id,
-                    file_path: chunk.file_path.to_string_lossy().to_string(),
+                    file_path,
                     content: chunk.content,
                     embedding,
                     content_hash: chunk.content_hash,
@@ -182,7 +203,7 @@ fn walk_markdown_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             let entry = entry?;
             let path = entry.path();
             if path.file_name().and_then(|n| n.to_str()) == Some(".kern") {
-                continue; // nunca reindexa o próprio estado do kern
+                continue; // never reindex kern's own state
             }
             if path.is_dir() {
                 stack.push(path);
@@ -194,26 +215,27 @@ fn walk_markdown_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Último recurso quando Ollama não responde: extrai `llama-server` (só
-/// existe em builds de release com a feature `bundled-llama-server`) e sobe
-/// contra um `.gguf` já em cache local. Nunca tenta baixar nada da rede —
-/// falha explícita e imediata se faltar peça (ver BDD: "Primeira execução
-/// sem internet falha de forma clara" — nenhum fallback silencioso).
+/// Last resort when Ollama doesn't respond: extracts `llama-server` (only
+/// exists in release builds with the `bundled-llama-server` feature) and
+/// starts it against a `.gguf` already in the local cache. Never attempts
+/// to download anything from the network — fails explicitly and
+/// immediately if a piece is missing (see BDD: "First run without
+/// internet fails clearly" — no silent fallback).
 async fn spawn_embedded_embedder() -> anyhow::Result<LlamaCppRuntime> {
     let binary = embedded::ensure_llama_server_binary().map_err(|e| {
-        anyhow::anyhow!("nenhum backend de modelo disponível: Ollama não responde em :11434 e {e}")
+        anyhow::anyhow!("no model backend available: Ollama is not responding on :11434 and {e}")
     })?;
     let model = embedded::find_cached_model().ok_or_else(|| {
         anyhow::anyhow!(
-            "SUPERFICIE_DE_AGENTE.MODELO_AUSENTE_NO_CACHE: nenhum .gguf encontrado em \
-             ~/.cache/kern/models — download automático via Hugging Face Hub ainda não \
-             implementado nesta build; popule o cache manualmente antes de rodar sem Ollama"
+            "AGENT_SURFACE.MODEL_MISSING_FROM_CACHE: no .gguf found in \
+             ~/.cache/kern/models — automatic download via Hugging Face Hub is not yet \
+             implemented in this build; populate the cache manually before running without Ollama"
         )
     })?;
     let port = pick_free_port()?;
     LlamaCppRuntime::spawn(&binary, &model, port)
         .await
-        .map_err(|e| anyhow::anyhow!("falha ao iniciar backend embarcado (llama-server): {e}"))
+        .map_err(|e| anyhow::anyhow!("failed to start embedded backend (llama-server): {e}"))
 }
 
 fn pick_free_port() -> anyhow::Result<u16> {
@@ -223,36 +245,69 @@ fn pick_free_port() -> anyhow::Result<u16> {
 
 async fn cmd_serve(project: String) -> anyhow::Result<()> {
     let mut state = ProcessState::Starting;
-    tracing::info!(?state, project, "iniciando");
+    tracing::info!(?state, project, "starting");
 
     let root = resolve_project(&project)?;
     let db_path = root.join(".kern").join("registry.db");
 
-    let ollama = OllamaClient::new("all-minilm");
-    let embedder: Arc<dyn EmbeddingProvider> = if ollama.probe().await {
-        Arc::new(ollama)
+    // A single probe decides both: Ollama serves as embedder and as
+    // extractor (llama3.2). The embedded backend (LlamaCppRuntime) only
+    // implements EmbeddingProvider — without Ollama, vector indexing keeps
+    // working, but ontology enrichment is disabled for this session (see
+    // catch_up_scan).
+    let ollama_available = OllamaClient::new("all-minilm").probe().await;
+    let embedder: Arc<dyn EmbeddingProvider> = if ollama_available {
+        Arc::new(OllamaClient::new("all-minilm"))
     } else {
         Arc::new(spawn_embedded_embedder().await?)
+    };
+    let extraction: Option<Arc<dyn ExtractionProvider>> = if ollama_available {
+        Some(Arc::new(OllamaClient::new("llama3.2")))
+    } else {
+        tracing::warn!(
+            "Ollama unavailable — ontology enrichment (extract/judge) disabled for this \
+             session; vector indexing continues normally"
+        );
+        None
     };
 
     let types: Arc<dyn TypeRepository> = Arc::new(SqliteTypeRepository::open(&db_path)?);
     let instances: Arc<dyn kern_ontology::InstanceRepository> =
         Arc::new(SqliteInstanceRepository::open(&db_path)?);
+    let frontmatter_profiles: Arc<dyn kern_ontology::FrontmatterProfileRepository> =
+        Arc::new(SqliteFrontmatterProfileRepository::open(&db_path)?);
     let vector_store: Arc<dyn VectorStore> =
         Arc::new(LanceVectorStore::open(&root.join(".kern").join("vectors")).await?);
 
+    let ontology_engine = extraction.map(|extraction| {
+        OntologyEngine::new(
+            types.clone(),
+            instances.clone(),
+            extraction,
+            frontmatter_profiles,
+            embedder.clone(),
+            AmbiguousZoneConfig::default(),
+        )
+    });
+
     state = ProcessState::CatchUpScan;
-    tracing::info!(?state, "varredura de recuperação — indexando corpus");
-    let indexed = catch_up_scan(&root, vector_store.as_ref(), embedder.as_ref()).await?;
-    tracing::info!(chunks_indexados = indexed, "catch-up concluído");
+    tracing::info!(?state, "catch-up scan — indexing corpus");
+    let indexed = catch_up_scan(
+        &root,
+        vector_store.as_ref(),
+        embedder.as_ref(),
+        ontology_engine.as_ref(),
+    )
+    .await?;
+    tracing::info!(chunks_indexed = indexed, "catch-up complete");
 
     state = ProcessState::Ready;
-    tracing::info!(?state, "pronto — servindo MCP via stdio");
+    tracing::info!(?state, "ready — serving MCP via stdio");
 
     let server = KernServer::new(types, instances, vector_store, embedder);
     let service = rmcp::ServiceExt::serve(server, rmcp::transport::stdio())
         .await
-        .inspect_err(|e| tracing::error!("erro ao servir: {e:?}"))?;
+        .inspect_err(|e| tracing::error!("error serving: {e:?}"))?;
 
     tokio::select! {
         result = service.waiting() => {
@@ -260,12 +315,12 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             state = ProcessState::Draining;
-            tracing::info!(?state, "sinal recebido — encerrando");
+            tracing::info!(?state, "signal received — shutting down");
         }
     }
 
     state = ProcessState::Stopped;
-    tracing::info!(?state, "encerrado");
+    tracing::info!(?state, "stopped");
     Ok(())
 }
 
@@ -274,9 +329,9 @@ async fn cmd_status(project: Option<String>) -> anyhow::Result<()> {
 
     let Some(name) = project else {
         if registry.is_empty() {
-            println!("nenhum projeto criado ainda — kern project create <nome> --path <pasta>");
+            println!("no project created yet — kern project create <name> --path <folder>");
         } else {
-            println!("projetos registrados:");
+            println!("registered projects:");
             for (name, path) in &registry {
                 println!("  {name} -> {}", path.display());
             }
@@ -297,16 +352,16 @@ async fn cmd_status(project: Option<String>) -> anyhow::Result<()> {
         .count();
     let chunk_count = vector_store.count().await?;
 
-    println!("projeto: {name} ({})", root.display());
-    println!("chunks indexados: {chunk_count}");
+    println!("project: {name} ({})", root.display());
+    println!("chunks indexed: {chunk_count}");
     println!(
-        "tipos de entidade: {} | tipos de relação: {} ({canonical} canônicos)",
+        "entity types: {} | relation types: {} ({canonical} canonical)",
         entity_types.len(),
         relation_types.len()
     );
     println!(
-        "nota: taxa de fallback é métrica em memória de uma sessão `serve` — \
-         não visível aqui entre processos (v0 é single-client, sem coordenação multi-processo)"
+        "note: fallback rate is an in-memory metric of a `serve` session — \
+         not visible here across processes (v0 is single-client, with no multi-process coordination)"
     );
     Ok(())
 }
@@ -317,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr) // stdout é reservado ao protocolo MCP
+        .with_writer(std::io::stderr) // stdout is reserved for the MCP protocol
         .init();
 
     let cli = Cli::parse();

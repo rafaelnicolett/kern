@@ -1,9 +1,9 @@
-//! kern-ingest — watcher + chunking markdown-aware.
+//! kern-ingest — markdown-aware watcher + chunking.
 //!
-//! Detecta mudança real (hash, não touch) na pasta observada, converte
-//! formatos não-MD via subprocesso externo configurável, e produz `Chunk`s
-//! que kern-vector indexa. Nunca processa o corpus inteiro — só o arquivo
-//! que mudou.
+//! Detects real change (hash, not touch) in the watched folder, converts
+//! non-MD formats via a configurable external subprocess, and produces
+//! `Chunk`s that kern-vector indexes. Never processes the entire corpus —
+//! only the file that changed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,15 +14,15 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum IngestError {
-    #[error("falha ao ler arquivo {path}: {source}")]
+    #[error("failed to read file {path}: {source}")]
     ReadFailed {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("subprocesso de conversão falhou: {0}")]
+    #[error("conversion subprocess failed: {0}")]
     ConversionFailed(String),
-    #[error("falha ao observar a pasta {path}: {source}")]
+    #[error("failed to watch folder {path}: {source}")]
     WatchFailed {
         path: PathBuf,
         #[source]
@@ -30,33 +30,33 @@ pub enum IngestError {
     },
 }
 
-/// Unidade indexada — ver docs/architecture/data/er-ingestao-indexacao.md
-/// no workspace de delivery.
+/// Indexed unit — design rationale documented in the maintainer's private
+/// delivery workspace, not published in this repo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub id: Uuid,
     pub file_path: PathBuf,
     pub content: String,
-    /// blake3 do conteúdo real — distingue mudança real de touch sem
-    /// conteúdo novo.
+    /// blake3 of the actual content — distinguishes a real change from a
+    /// touch with no new content.
     pub content_hash: String,
-    /// Presentes só se o chunk veio de um arquivo convertido de formato
-    /// não-MD — contrato de proveniência obrigatório.
+    /// Present only if the chunk came from a file converted from a non-MD
+    /// format — mandatory provenance contract.
     pub source_original: Option<PathBuf>,
     pub source_page: Option<String>,
     pub source_section: Option<String>,
 }
 
-/// blake3 do conteúdo — usado tanto pro hash por-arquivo (dedup de touch)
-/// quanto pro `content_hash` de cada chunk.
+/// blake3 of the content — used both for the per-file hash (touch dedup)
+/// and for each chunk's `content_hash`.
 pub fn hash_content(content: &str) -> String {
     blake3::hash(content.as_bytes()).to_hex().to_string()
 }
 
-/// Compara o hash atual do arquivo contra o último processado. `None` em
-/// `known_hashes` (arquivo nunca visto) sempre conta como mudança real.
-/// Pura — sem I/O — testável sem tocar disco. Ver cenário BDD "Touch sem
-/// conteúdo novo não dispara reprocessamento".
+/// Compares the file's current hash to the last one processed. `None` in
+/// `known_hashes` (file never seen before) always counts as a real change.
+/// Pure — no I/O — testable without touching disk. See the BDD scenario
+/// "Touch with no new content does not trigger reprocessing".
 pub fn is_real_change(
     file_path: &Path,
     content: &str,
@@ -69,16 +69,17 @@ pub fn is_real_change(
     }
 }
 
-/// Port: chunking markdown-aware — nunca corta header, bloco de código ou
-/// tabela no meio. Pura/síncrona: é CPU-bound, o chamador decide se roda em
-/// `spawn_blocking` (ver Skill lang-rust, regra de não bloquear o runtime).
+/// Port: markdown-aware chunking — never cuts a header, code block, or
+/// table in half. Pure/synchronous: it's CPU-bound, the caller decides
+/// whether to run it in `spawn_blocking` (per this project's Rust
+/// conventions on not blocking the runtime).
 pub trait MarkdownChunker: Send + Sync {
     fn chunk(&self, file_path: &Path, content: &str) -> Vec<Chunk>;
 }
 
-/// Implementação real: divide o documento nos limites de heading (`#`, `##`,
-/// ...). Como só heading dispara um novo corte, blocos de código e tabelas
-/// — que nunca são eventos de heading — nunca ficam partidos ao meio.
+/// Real implementation: splits the document at heading boundaries (`#`,
+/// `##`, ...). Since only a heading triggers a new cut, code blocks and
+/// tables — which are never heading events — never end up split in half.
 pub struct StructuralMarkdownChunker;
 
 impl MarkdownChunker for StructuralMarkdownChunker {
@@ -118,16 +119,16 @@ impl MarkdownChunker for StructuralMarkdownChunker {
     }
 }
 
-/// Evento bruto do watcher — o que mudou, sem julgar se é reprocessamento
-/// real (isso é responsabilidade de `is_real_change`, mais barato de testar
-/// isolado do filesystem).
+/// Raw event from the watcher — what changed, without judging whether it's
+/// a real reprocessing (that's `is_real_change`'s responsibility, cheaper
+/// to test in isolation from the filesystem).
 #[derive(Debug, Clone)]
 pub struct FileChangedEvent {
     pub path: PathBuf,
 }
 
-/// Watcher da pasta observada — orientado a evento via `notify`, nunca
-/// polling em loop (Skill lang-rust, seção 2.4).
+/// Watcher for the observed folder — event-driven via `notify`, never
+/// polling in a loop (per this project's Rust conventions, section 2.4).
 pub struct Watcher {
     pub root: PathBuf,
 }
@@ -137,10 +138,11 @@ impl Watcher {
         Self { root }
     }
 
-    /// Sobe o watcher e envia um `FileChangedEvent` por escrita detectada.
-    /// TODO(S2-BKD-05): hoje reporta toda escrita — o filtro de mudança real
-    /// (`is_real_change`) roda no consumidor do canal, que mantém o mapa de
-    /// hashes conhecidos (estado de aplicação, não do watcher em si).
+    /// Starts the watcher and sends a `FileChangedEvent` for each detected
+    /// write. TODO: today it reports every write — the real-change filter
+    /// (`is_real_change`) runs in the channel's consumer, which keeps the
+    /// map of known hashes (application state, not the watcher's own
+    /// state).
     pub async fn run(
         &self,
         tx: tokio::sync::mpsc::Sender<FileChangedEvent>,
@@ -179,52 +181,52 @@ impl Watcher {
     }
 }
 
-// TODO(S2-BKD-02): função/adapter que invoca o subprocesso de conversão
-// configurável (MarkItDown/Pandoc) para arquivo não-MD, populando
-// source_original/source_page/source_section no Chunk resultante.
+// TODO: function/adapter that invokes the configurable conversion
+// subprocess (MarkItDown/Pandoc) for non-MD files, populating
+// source_original/source_page/source_section in the resulting Chunk.
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn hash_muda_com_conteudo_diferente() {
+    fn hash_changes_with_different_content() {
         assert_ne!(hash_content("a"), hash_content("b"));
         assert_eq!(hash_content("a"), hash_content("a"));
     }
 
     #[test]
-    fn touch_sem_mudanca_real_nao_reprocessa() {
+    fn touch_without_real_change_does_not_reprocess() {
         let mut known = HashMap::new();
         let path = PathBuf::from("a.md");
-        let h = hash_content("conteúdo");
+        let h = hash_content("content");
         known.insert(path.clone(), h);
 
-        assert_eq!(is_real_change(&path, "conteúdo", &known), None);
-        assert!(is_real_change(&path, "conteúdo novo", &known).is_some());
+        assert_eq!(is_real_change(&path, "content", &known), None);
+        assert!(is_real_change(&path, "new content", &known).is_some());
     }
 
     #[test]
-    fn arquivo_nunca_visto_conta_como_mudanca() {
+    fn never_seen_file_counts_as_change() {
         let known = HashMap::new();
-        let path = PathBuf::from("novo.md");
-        assert!(is_real_change(&path, "qualquer coisa", &known).is_some());
+        let path = PathBuf::from("new.md");
+        assert!(is_real_change(&path, "anything", &known).is_some());
     }
 
     #[test]
-    fn chunking_nunca_corta_bloco_de_codigo_ou_tabela() {
+    fn chunking_never_splits_a_code_block_or_table() {
         let content = "\
-# Título
+# Title
 
-Texto antes.
+Text before.
 
 ```rust
 fn f() {
-    // continua
+    // continues
 }
 ```
 
-## Segunda seção
+## Second section
 
 | a | b |
 |---|---|
@@ -233,26 +235,18 @@ fn f() {
         let chunker = StructuralMarkdownChunker;
         let chunks = chunker.chunk(Path::new("doc.md"), content);
 
-        assert!(
-            chunks.len() >= 2,
-            "esperava pelo menos 2 chunks (2 headings)"
-        );
+        assert!(chunks.len() >= 2, "expected at least 2 chunks (2 headings)");
         for c in &chunks {
             let opens = c.content.matches("```").count();
-            assert_eq!(
-                opens % 2,
-                0,
-                "bloco de código cortado no meio: {:?}",
-                c.content
-            );
+            assert_eq!(opens % 2, 0, "code block split in half: {:?}", c.content);
         }
         let joined: String = chunks.iter().map(|c| c.content.as_str()).collect();
         assert!(joined.contains("| a | b |") && joined.contains("| 1 | 2 |"));
     }
 
     #[test]
-    fn documento_sem_heading_vira_um_chunk_so() {
-        let content = "Só texto solto, sem heading nenhum.\n";
+    fn document_without_heading_becomes_a_single_chunk() {
+        let content = "Just loose text, no heading at all.\n";
         let chunker = StructuralMarkdownChunker;
         let chunks = chunker.chunk(Path::new("doc.md"), content);
         assert_eq!(chunks.len(), 1);

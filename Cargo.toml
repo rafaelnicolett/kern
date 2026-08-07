@@ -16,9 +16,9 @@ rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kern-dev/kern"
 
-# Dependências compartilhadas — versão única fixada aqui, crates referenciam
-# via `dep.workspace = true`. Evita drift de versão entre crates do mesmo
-# workspace (ver Skill lang-rust, seção 1).
+# Shared dependencies — a single version pinned here, crates reference it
+# via `dep.workspace = true`. Avoids version drift between crates in the
+# same workspace.
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "fs", "io-util", "time"] }
 async-trait = "0.1"

@@ -29,9 +29,9 @@ tar = { version = "0.4.46", optional = true }
 flate2 = { version = "1.1.9", optional = true }
 
 [features]
-# Ativada só pela release CI (.github/workflows/release.yml) — embute
-# llama-server + libs compartilhadas via include_bytes!, ver src/embedded.rs.
-# Builds de dev/PR ficam sem ela: sem binário embarcado, só Ollama oportunista.
+# Enabled only by the CI release (.github/workflows/release.yml) — embeds
+# llama-server + shared libs via include_bytes!, see src/embedded.rs.
+# Dev/PR builds go without it: no embedded binary, only opportunistic Ollama.
 bundled-llama-server = ["dep:tar", "dep:flate2"]
 
 [dev-dependencies]

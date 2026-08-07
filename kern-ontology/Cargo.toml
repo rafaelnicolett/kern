@@ -13,12 +13,12 @@ thiserror.workspace = true
 serde.workspace = true
 uuid.workspace = true
 tracing.workspace = true
-# bundled: compila o SQLite a partir do source, sem exigir libsqlite3 do
-# sistema — necessário pro binário final ser realmente autocontido.
+# bundled: compiles SQLite from source, without requiring the system's
+# libsqlite3 — necessary for the final binary to be truly self-contained.
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json.workspace = true
-# Só pra extrair as CHAVES do bloco de frontmatter YAML — nunca os valores
-# viram parte do fingerprint (docs/domain/ontologia/aggregates.md, Agregado 3).
+# Only to extract the KEYS from the YAML frontmatter block — the values
+# never become part of the fingerprint.
 serde_yaml = "0.9"
 blake3 = "1"
 

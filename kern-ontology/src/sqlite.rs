@@ -1,11 +1,10 @@
-//! Adapters de saída (Adapters/Out) sobre SQLite — implementam
-//! `TypeRepository` e `InstanceRepository` via `rusqlite`, sem ORM (ver
-//! docs/adr/0004 no workspace de delivery). Um arquivo por projeto
-//! (`<projeto>/.kern/registry.db`).
+//! Outbound adapters (Adapters/Out) over SQLite — implement
+//! `TypeRepository` and `InstanceRepository` via `rusqlite`, no ORM
+//! (see docs/adr/0004). One file per project (`<project>/.kern/registry.db`).
 //!
-//! `rusqlite::Connection` não é `Sync` — cada chamada roda em
-//! `spawn_blocking` sobre uma conexão guardada por `Mutex`, nunca direto no
-//! runtime Tokio (Skill lang-rust, seção 2.4).
+//! `rusqlite::Connection` is not `Sync` — every call runs in
+//! `spawn_blocking` over a connection guarded by a `Mutex`, never directly
+//! on the Tokio runtime (per the lang-rust skill, section 2.4).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -43,15 +42,15 @@ fn status_from_str(s: &str) -> RelationTypeStatus {
 }
 
 pub(crate) fn now() -> String {
-    // TODO: trocar por chrono::Utc::now() quando a dependência entrar no
-    // workspace (mesma decisão pendente já registrada em ChunkRecord).
+    // TODO: switch to chrono::Utc::now() once the dependency lands in the
+    // workspace (same pending decision already noted on ChunkRecord).
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_default()
 }
 
-/// Adapter real do Agregado 1 (Registro de Tipos).
+/// Real adapter for the Type Registry aggregate.
 pub struct SqliteTypeRepository {
     conn: Arc<Mutex<Connection>>,
 }
@@ -97,7 +96,7 @@ impl SqliteTypeRepository {
             name,
             description,
             status: status_from_str(&status),
-            independent_hits: 0, // preenchido por quem chama, via count_hits, quando relevante
+            independent_hits: 0, // filled in by the caller, via count_hits, when relevant
             instance_count: instance_count as u64,
         })
     }
@@ -153,7 +152,7 @@ impl TypeRepository for SqliteTypeRepository {
                     params![
                         Uuid::new_v4().to_string(),
                         name,
-                        format!("tipo canônico semeado: {name}"),
+                        format!("seeded canonical type: {name}"),
                         status_to_str(RelationTypeStatus::Canonical),
                         now()
                     ],
@@ -280,7 +279,7 @@ impl TypeRepository for SqliteTypeRepository {
     }
 }
 
-/// Adapter real do Agregado 2 (Grafo de Instâncias).
+/// Real adapter for the Instance Graph aggregate.
 pub struct SqliteInstanceRepository {
     conn: Arc<Mutex<Connection>>,
 }
@@ -370,8 +369,8 @@ impl InstanceRepository for SqliteInstanceRepository {
 
             let id = Uuid::new_v4();
             let updated_at = now();
-            // first_seen_file é imutável após a criação (invariante do
-            // Agregado 2) — só é escrito neste INSERT, nunca num UPDATE.
+            // first_seen_file is immutable after creation — it's only
+            // written in this INSERT, never in an UPDATE.
             conn.execute(
                 "INSERT INTO entities (id, type_id, canonical_name, first_seen_file, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -525,7 +524,7 @@ impl InstanceRepository for SqliteInstanceRepository {
                 return Ok::<_, OntologyError>(Some(Vec::new()));
             }
 
-            // BFS: cada nó visitado guarda (relação usada pra chegar nele, nó anterior).
+            // BFS: each visited node stores (relation used to reach it, previous node).
             let mut visited: std::collections::HashMap<Uuid, (RelationRecord, Uuid)> =
                 std::collections::HashMap::new();
             let mut frontier = vec![from];
@@ -586,7 +585,7 @@ impl InstanceRepository for SqliteInstanceRepository {
     }
 }
 
-/// Adapter real do Agregado 3 (Perfil de Frontmatter).
+/// Real adapter for the Frontmatter Profile aggregate.
 pub struct SqliteFrontmatterProfileRepository {
     conn: Arc<Mutex<Connection>>,
 }
@@ -702,7 +701,7 @@ mod tests {
     use crate::{RelationTypeStatus, PROMOTION_THRESHOLD};
 
     #[tokio::test]
-    async fn seed_semeia_os_8_tipos_canonicos() {
+    async fn seed_seeds_the_8_canonical_types() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteTypeRepository::open(&dir.path().join("registry.db")).unwrap();
         repo.seed_canonical_vocabulary().await.unwrap();
@@ -714,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seed_e_idempotente() {
+    async fn seed_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteTypeRepository::open(&dir.path().join("registry.db")).unwrap();
         repo.seed_canonical_vocabulary().await.unwrap();
@@ -729,30 +728,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_candidate_e_get_or_create() {
+    async fn register_candidate_is_get_or_create() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteTypeRepository::open(&dir.path().join("registry.db")).unwrap();
 
         let first = repo
-            .register_candidate_type("relates_loosely_to", "tipo emergente de teste")
+            .register_candidate_type("relates_loosely_to", "emergent test type")
             .await
             .unwrap();
         assert_eq!(first.status, RelationTypeStatus::Candidate);
 
         let second = repo
-            .register_candidate_type("relates_loosely_to", "descrição ignorada na 2a chamada")
+            .register_candidate_type("relates_loosely_to", "description ignored on the 2nd call")
             .await
             .unwrap();
-        assert_eq!(first.id, second.id, "get-or-create não deveria duplicar");
+        assert_eq!(first.id, second.id, "get-or-create shouldn't duplicate");
     }
 
     #[tokio::test]
-    async fn promocao_a_canonico_apos_threshold_de_arquivos_independentes() {
+    async fn promotion_to_canonical_after_threshold_of_independent_files() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteTypeRepository::open(&dir.path().join("registry.db")).unwrap();
 
         let candidate = repo
-            .register_candidate_type("influences", "tipo emergente")
+            .register_candidate_type("influences", "emergent type")
             .await
             .unwrap();
 
@@ -765,14 +764,14 @@ mod tests {
         }
         assert_eq!(last_count, PROMOTION_THRESHOLD);
 
-        // Mesmo arquivo de novo não deveria contar como um 4º hit.
+        // The same file again should not count as a 4th hit.
         let repeated = repo
             .record_independent_hit(candidate.id, "doc-0.md")
             .await
             .unwrap();
         assert_eq!(
             repeated, PROMOTION_THRESHOLD,
-            "mesmo arquivo não conta duas vezes"
+            "the same file doesn't count twice"
         );
 
         repo.promote_to_canonical(candidate.id).await.unwrap();
@@ -785,7 +784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_or_create_entity_nao_duplica_e_preserva_first_seen_file() {
+    async fn find_or_create_entity_does_not_duplicate_and_preserves_first_seen_file() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteInstanceRepository::open(&dir.path().join("registry.db")).unwrap();
         let type_id = Uuid::new_v4();
@@ -795,19 +794,19 @@ mod tests {
             .await
             .unwrap();
         let second = repo
-            .find_or_create_entity(type_id, "kern-ontology", "outro-arquivo.md")
+            .find_or_create_entity(type_id, "kern-ontology", "other-file.md")
             .await
             .unwrap();
 
-        assert_eq!(first.id, second.id, "mesma entidade, não deveria duplicar");
+        assert_eq!(first.id, second.id, "same entity, shouldn't duplicate");
         assert_eq!(
             second.first_seen_file, "arch.md",
-            "first_seen_file é imutável após a criação"
+            "first_seen_file is immutable after creation"
         );
     }
 
     #[tokio::test]
-    async fn relations_exigem_evidencia_e_related_entities_percorre_o_grafo() {
+    async fn relations_require_evidence_and_related_entities_walks_the_graph() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteInstanceRepository::open(&dir.path().join("registry.db")).unwrap();
         let type_id = Uuid::new_v4();
@@ -851,12 +850,12 @@ mod tests {
         assert_eq!(depth1[0].id, b.id);
 
         let depth2 = repo.related_entities(a.id, 2).await.unwrap();
-        assert_eq!(depth2.len(), 2, "profundidade 2 deveria alcançar c via b");
+        assert_eq!(depth2.len(), 2, "depth 2 should reach c via b");
         assert!(depth2.iter().any(|e| e.id == c.id));
     }
 
     #[tokio::test]
-    async fn find_entities_by_name_e_case_insensitive_e_por_substring() {
+    async fn find_entities_by_name_is_case_insensitive_and_by_substring() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteInstanceRepository::open(&dir.path().join("registry.db")).unwrap();
         let type_id = Uuid::new_v4();
@@ -877,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_path_encontra_o_caminho_mais_curto() {
+    async fn find_path_finds_the_shortest_path() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteInstanceRepository::open(&dir.path().join("registry.db")).unwrap();
         let type_id = Uuid::new_v4();
@@ -918,11 +917,11 @@ mod tests {
 
         let path = repo.find_path(a.id, c.id, 5).await.unwrap();
         assert!(path.is_some());
-        assert_eq!(path.unwrap().len(), 2, "a->b->c são 2 saltos");
+        assert_eq!(path.unwrap().len(), 2, "a->b->c is 2 hops");
     }
 
     #[tokio::test]
-    async fn find_path_retorna_none_sem_conexao() {
+    async fn find_path_returns_none_without_a_connection() {
         let dir = tempfile::tempdir().unwrap();
         let repo = SqliteInstanceRepository::open(&dir.path().join("registry.db")).unwrap();
         let type_id = Uuid::new_v4();
@@ -941,13 +940,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_types_retorna_tipos_registrados() {
+    async fn list_types_returns_registered_types() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("registry.db");
         let types = SqliteTypeRepository::open(&db_path).unwrap();
         types.seed_canonical_vocabulary().await.unwrap();
         types
-            .find_or_create_entity_type("Crate", "um crate")
+            .find_or_create_entity_type("Crate", "a crate")
             .await
             .unwrap();
 

@@ -14,6 +14,6 @@ serde_json.workspace = true
 tracing.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
-# LlamaCppRuntime spawna `llama-server` via tokio::process::Command (feature
-# "process" do tokio, já habilitada no workspace) e fala HTTP local com o
-# mesmo cliente reqwest — sem dependência de crate extra.
+# LlamaCppRuntime spawns `llama-server` via tokio::process::Command (the
+# "process" feature of tokio, already enabled at the workspace level) and
+# talks local HTTP with the same reqwest client — no extra crate dependency.

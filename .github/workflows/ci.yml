@@ -15,17 +15,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # lance-encoding (dependência transitiva via lancedb) compila .proto
-      # com prost-build em build.rs — exige o binário `protoc` no PATH, o
-      # runner do GitHub não vem com ele por padrão (achado real: build
-      # local funcionava porque este Mac já tinha protoc via Homebrew,
-      # mascarando a falta no CI até o primeiro push).
-      - name: Instalar protoc (protobuf-compiler)
+      # lance-encoding (a transitive dependency via lancedb) compiles .proto
+      # files with prost-build in build.rs — it needs the `protoc` binary on
+      # PATH, and the GitHub runner doesn't ship it by default (real finding:
+      # local builds worked because this Mac already had protoc via
+      # Homebrew, masking the gap until the first CI run).
+      - name: Install protoc (protobuf-compiler)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      # Instala exatamente o toolchain pinado em rust-toolchain.toml — nunca
-      # `stable` solto (ver docs/adr/0003 e Skill lang-rust).
-      - name: Instalar toolchain pinado
+      # Installs exactly the toolchain pinned in rust-toolchain.toml — never
+      # a loose `stable` channel.
+      - name: Install pinned toolchain
         run: rustup show
 
       - uses: Swatinem/rust-cache@v2
@@ -40,23 +40,23 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace
-        # Testes de integração real contra Ollama (`extract`/`judge`/`embed`)
-        # pulam graciosamente (não falham) quando o daemon não está
-        # disponível — CI não precisa de Ollama instalado. Ver
-        # sprint-status.md do workspace de delivery para o racional.
+        # Real integration tests against Ollama (`extract`/`judge`/`embed`)
+        # skip gracefully (don't fail) when the daemon isn't available —
+        # CI doesn't need Ollama installed.
 
-      - name: Validar Cargo.lock commitado
+      - name: Validate committed Cargo.lock
         run: cargo update --workspace --locked
-        # Falha se Cargo.lock estiver desatualizado em relação ao Cargo.toml
-        # — garante que o lockfile commitado é o que o CI de fato usou.
+        # Fails if Cargo.lock is out of date relative to Cargo.toml —
+        # guarantees the committed lockfile is what CI actually used.
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
-    # rustsec/audit-check publica o resultado como GitHub Check Run — sem
-    # isso o job roda o audit (que passa) e falha só na publicação, com
-    # "Resource not accessible by integration" (achado real: permissão
-    # padrão do GITHUB_TOKEN em repo novo não inclui checks:write).
+    # rustsec/audit-check publishes its result as a GitHub Check Run —
+    # without this, the job runs the audit (which passes) and only fails on
+    # publishing, with "Resource not accessible by integration" (real
+    # finding: the default GITHUB_TOKEN permissions on a new repo don't
+    # include checks:write).
     permissions:
       contents: read
       checks: write

@@ -12,20 +12,20 @@ thiserror.workspace = true
 serde.workspace = true
 uuid.workspace = true
 tracing.workspace = true
-# 0.4.x estava fixado por engano (versão de treinamento desatualizada) —
-# latest real é 0.33.x (jul/2026). Sem pin de versão própria para
-# arrow-array/arrow-schema: usar exatamente o que lancedb já traz.
+# 0.4.x was pinned by mistake (outdated training-data version) — the real
+# latest is 0.33.x (Jul/2026). No separate version pin for
+# arrow-array/arrow-schema: use exactly what lancedb already brings in.
 lancedb = "0.33"
 futures = "0.3"
 
-# Sem dependência direta de arrow-array/arrow-schema: usar os tipos
-# reexportados via `lancedb::arrow::*`, senão o resolver do Cargo traz uma
-# segunda árvore de arrow (versão mais nova) incompatível em tipo com a que
-# o lancedb usa internamente (achado real — ver sprint-status.md).
+# No direct dependency on arrow-array/arrow-schema: use the types re-exported
+# via `lancedb::arrow::*`, otherwise Cargo's resolver pulls in a second arrow
+# tree (a newer version) that's type-incompatible with the one lancedb uses
+# internally (empirically confirmed).
 
 [dev-dependencies]
 tempfile = "3"
-# Só para o teste de integração fim a fim (tests/pipeline.rs) — kern-vector
-# em si não depende de kern-ingest/kern-model em produção.
+# Only for the end-to-end integration test (tests/pipeline.rs) — kern-vector
+# itself doesn't depend on kern-ingest/kern-model in production.
 kern-ingest.workspace = true
 kern-model.workspace = true

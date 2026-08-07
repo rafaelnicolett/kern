@@ -1,9 +1,9 @@
-//! kern-model — abstração de provedor de modelo (embedding + extração/judge).
+//! kern-model — model provider abstraction (embedding + extraction/judge).
 //!
-//! Ports (traits) consumidos por kern-ingest (embed) e kern-ontology
-//! (extract/judge). Backend real (embarcado via subprocesso llama-server, ou
-//! Ollama oportunista) é detalhe de implementação por trás destes traits —
-//! ver docs/adr/0001 no workspace de delivery (arquitetura hexagonal).
+//! Ports (traits) consumed by kern-ingest (embed) and kern-ontology
+//! (extract/judge). The real backend (embedded via a llama-server subprocess,
+//! or opportunistic Ollama) is an implementation detail behind these traits
+//! (hexagonal architecture, see docs/adr/0001).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -12,41 +12,41 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ModelError {
-    #[error("subprocesso de inferência indisponível: {0}")]
+    #[error("inference subprocess unavailable: {0}")]
     BackendUnavailable(String),
-    #[error("resposta de inferência malformada: {0}")]
+    #[error("malformed inference response: {0}")]
     MalformedResponse(String),
-    #[error("requisição HTTP ao backend falhou: {0}")]
+    #[error("HTTP request to backend failed: {0}")]
     Http(#[from] reqwest::Error),
-    // TODO(S3-BKD-03): variantes de timeout, modelo não carregado, etc.
+    // TODO: timeout variants, model not loaded, etc.
 }
 
-/// Port consumido por kern-ingest para vetorizar chunks.
+/// Port consumed by kern-ingest to vectorize chunks.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, ModelError>;
-    // TODO(kern-ingest): embed_batch para reduzir round-trips no subprocesso.
+    // TODO(kern-ingest): embed_batch to reduce round-trips to the subprocess.
 }
 
-/// Candidato de entidade/relação extraído de um chunk — pré-classificação.
-/// TODO(S3-BKD-03): substituir pelo tipo real, compartilhado com kern-ontology
-/// (hoje aqui só pra dar forma à assinatura do trait).
+/// Entity/relation candidate extracted from a chunk — pre-classification.
+/// TODO: replace with the real type, shared with kern-ontology (for now it's
+/// only here to shape the trait signature).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateEntity {
     pub raw_name: String,
     pub raw_type_hint: Option<String>,
 }
 
-/// Vocabulário de relação — os 8 tipos canônicos semeados + candidatos
-/// promovidos. TODO(S3-BKD-01): tipo real vem de kern-ontology; aqui é só
-/// placeholder pra fechar a assinatura de `extract`.
+/// Relation vocabulary — the 8 seeded canonical types plus promoted
+/// candidates. TODO: the real type comes from kern-ontology; this is just a
+/// placeholder to close out `extract`'s signature.
 #[derive(Debug, Clone, Default)]
 pub struct RelationVocabulary {
     pub canonical_types: Vec<String>,
 }
 
-/// Tipo de entidade já existente, candidato a match — usado por `judge`.
-/// TODO(S3-BKD-03): substituir pelo tipo real de kern-ontology::TypeRegistry.
+/// An already-existing entity type, candidate for a match — used by `judge`.
+/// TODO: replace with the real type from kern-ontology::TypeRegistry.
 #[derive(Debug, Clone)]
 pub struct EntityType {
     pub name: String,
@@ -60,9 +60,9 @@ pub enum JudgeDecision {
     Reject,
 }
 
-/// Port consumido por kern-ontology — só chamado na zona ambígua (ver
-/// docs/domain/ontologia/aggregates.md no workspace de delivery). Carregado
-/// lazy, descarregado após ociosidade.
+/// Port consumed by kern-ontology — only called in the ambiguous zone
+/// (design rationale kept in the maintainer's private delivery workspace,
+/// not published in this repo). Loaded lazily, unloaded after idling.
 #[async_trait]
 pub trait ExtractionProvider: Send + Sync {
     async fn extract(
@@ -77,29 +77,28 @@ pub trait ExtractionProvider: Send + Sync {
         nearest_existing: &[EntityType],
     ) -> Result<JudgeDecision, ModelError>;
 
-    /// Interpreta o mapeamento de campos de frontmatter -> conceitos
-    /// canônicos, uma única vez por forma nova (docs/domain/ontologia/aggregates.md,
-    /// Agregado 3). `keys` é o conjunto de chaves do frontmatter, nunca os
-    /// valores. Retorna, por chave, o conceito canônico correspondente
-    /// (`id`, `kind`, `status`, `depends_on`, `implements`, ...) ou `None`
-    /// se a chave não mapear pra nada conhecido.
+    /// Interprets the frontmatter field -> canonical concept mapping, once
+    /// per new shape. `keys` is the set of frontmatter keys, never the
+    /// values. Returns, per key, the matching canonical concept (`id`,
+    /// `kind`, `status`, `depends_on`, `implements`, ...) or `None` if the
+    /// key doesn't map to anything known.
     async fn interpret_frontmatter_schema(
         &self,
         keys: &[String],
     ) -> Result<std::collections::HashMap<String, Option<String>>, ModelError>;
 }
 
-/// Backend embarcado — spawna `llama-server` (llama.cpp) como subprocesso
-/// local e fala com ele via HTTP (`/v1/embeddings`, compatível OpenAI).
-/// `ExtractionProvider` não é implementado aqui: extração/judge ficam
-/// restritos ao adapter oportunista (`OllamaClient`) até um modelo
-/// generativo embarcado entrar no escopo (ver docs/adr no workspace de
-/// delivery).
+/// Embedded backend — spawns `llama-server` (llama.cpp) as a local
+/// subprocess and talks to it over HTTP (`/v1/embeddings`, OpenAI-compatible).
+/// `ExtractionProvider` is not implemented here: extraction/judge remain
+/// restricted to the opportunistic adapter (`OllamaClient`) until an embedded
+/// generative model comes into scope (design rationale kept in the
+/// maintainer's private delivery workspace, not published in this repo).
 pub struct LlamaCppRuntime {
     base_url: String,
     http: reqwest::Client,
-    // Mantém o subprocesso vivo pela duração do runtime — dropar isto
-    // encerra o `llama-server` (kill_on_drop, ver `spawn`).
+    // Keeps the subprocess alive for the runtime's lifetime — dropping this
+    // terminates the `llama-server` (kill_on_drop, see `spawn`).
     _child: tokio::process::Child,
 }
 
@@ -119,10 +118,10 @@ struct OpenAiEmbedDatum {
 }
 
 impl LlamaCppRuntime {
-    /// Sobe `llama-server` apontando pro `.gguf` em `model_path`, na porta
-    /// `port` (localhost apenas), e aguarda `/health` responder OK antes de
-    /// retornar — nunca devolve um runtime que ainda não está pronto pra
-    /// servir embeddings.
+    /// Starts `llama-server` pointing at the `.gguf` in `model_path`, on
+    /// port `port` (localhost only), and waits for `/health` to respond OK
+    /// before returning — never returns a runtime that isn't yet ready to
+    /// serve embeddings.
     pub async fn spawn(
         binary_path: &std::path::Path,
         model_path: &std::path::Path,
@@ -141,22 +140,21 @@ impl LlamaCppRuntime {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
-                ModelError::BackendUnavailable(format!("falha ao iniciar llama-server: {e}"))
+                ModelError::BackendUnavailable(format!("failed to start llama-server: {e}"))
             })?;
 
         let base_url = format!("http://127.0.0.1:{port}");
         let http = reqwest::Client::new();
 
-        // Poll de prontidão — llama-server carrega o modelo antes de abrir
-        // o socket HTTP, então as primeiras tentativas de conexão falham
-        // normalmente; timeout total generoso o suficiente pra modelos
-        // pequenos (o processo de release usa modelos na faixa de dezenas
-        // de MB, não LLMs completos).
+        // Readiness poll — llama-server loads the model before opening the
+        // HTTP socket, so the first connection attempts normally fail; total
+        // timeout generous enough for small models (the release process
+        // uses models in the tens-of-MB range, not full-size LLMs).
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(ModelError::BackendUnavailable(format!(
-                    "llama-server encerrou antes de ficar pronto (status: {status})"
+                    "llama-server exited before becoming ready (status: {status})"
                 )));
             }
 
@@ -173,7 +171,7 @@ impl LlamaCppRuntime {
             if tokio::time::Instant::now() >= deadline {
                 let _ = child.kill().await;
                 return Err(ModelError::BackendUnavailable(
-                    "llama-server não respondeu /health dentro do timeout".to_string(),
+                    "llama-server did not respond to /health within the timeout".to_string(),
                 ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -206,12 +204,12 @@ impl EmbeddingProvider for LlamaCppRuntime {
             .into_iter()
             .next()
             .map(|d| d.embedding)
-            .ok_or_else(|| ModelError::MalformedResponse("resposta sem embeddings".to_string()))
+            .ok_or_else(|| ModelError::MalformedResponse("response without embeddings".to_string()))
     }
 }
 
-/// Adapter oportunista — só usado se o probe em `:11434` detectar o daemon.
-/// Nunca dependência obrigatória (ver docs/adr — decisão fechada).
+/// Opportunistic adapter — only used if the probe on `:11434` detects the
+/// daemon. Never a required dependency (a closed design decision).
 pub struct OllamaClient {
     base_url: String,
     model: String,
@@ -242,8 +240,9 @@ impl OllamaClient {
         }
     }
 
-    /// Sonda de disponibilidade — nunca trata Ollama como obrigatório; quem
-    /// chama decide o que fazer se retornar `false` (cair pro embarcado).
+    /// Availability probe — never treats Ollama as mandatory; the caller
+    /// decides what to do if this returns `false` (fall back to the
+    /// embedded backend).
     pub async fn probe(&self) -> bool {
         self.http
             .get(format!("{}/api/version", self.base_url))
@@ -275,7 +274,7 @@ impl EmbeddingProvider for OllamaClient {
             .embeddings
             .into_iter()
             .next()
-            .ok_or_else(|| ModelError::MalformedResponse("resposta sem embeddings".to_string()))
+            .ok_or_else(|| ModelError::MalformedResponse("response without embeddings".to_string()))
     }
 }
 
@@ -405,15 +404,15 @@ impl ExtractionProvider for OllamaClient {
         vocab: &RelationVocabulary,
     ) -> Result<Vec<CandidateEntity>, ModelError> {
         let types_hint = if vocab.canonical_types.is_empty() {
-            "nenhum tipo canônico ainda".to_string()
+            "no canonical types yet".to_string()
         } else {
             vocab.canonical_types.join(", ")
         };
         let prompt = format!(
-            "Extraia entidades candidatas (conceitos, componentes, artefatos) \
-             mencionados no texto abaixo. Tipos de relação canônicos conhecidos \
-             (só para contexto, não invente relações): {types_hint}\n\n\
-             Texto:\n{chunk}"
+            "Extract candidate entities (concepts, components, artifacts) \
+             mentioned in the text below. Known canonical relation types \
+             (context only, don't invent relations): {types_hint}\n\n\
+             Text:\n{chunk}"
         );
 
         let extracted: ExtractedEntities =
@@ -427,7 +426,7 @@ impl ExtractionProvider for OllamaClient {
         nearest_existing: &[EntityType],
     ) -> Result<JudgeDecision, ModelError> {
         let existing_list = if nearest_existing.is_empty() {
-            "nenhum tipo próximo encontrado".to_string()
+            "no nearby type found".to_string()
         } else {
             nearest_existing
                 .iter()
@@ -436,14 +435,14 @@ impl ExtractionProvider for OllamaClient {
                 .join("\n")
         };
         let prompt = format!(
-            "Um candidato de entidade caiu na zona ambígua de similaridade contra \
-             tipos já existentes. Decida: 'Merge' (é o mesmo conceito de um tipo \
-             existente), 'NewType' (é um conceito genuinamente novo), ou 'Reject' \
-             (não é uma entidade válida — ruído de extração).\n\n\
-             Candidato: {} (dica de tipo: {})\n\n\
-             Tipos existentes mais próximos:\n{existing_list}",
+            "An entity candidate fell into the ambiguous zone of similarity \
+             against existing types. Decide: 'Merge' (it's the same concept \
+             as an existing type), 'NewType' (it's a genuinely new concept), \
+             or 'Reject' (it's not a valid entity — extraction noise).\n\n\
+             Candidate: {} (type hint: {})\n\n\
+             Closest existing types:\n{existing_list}",
             candidate.raw_name,
-            candidate.raw_type_hint.as_deref().unwrap_or("nenhuma"),
+            candidate.raw_type_hint.as_deref().unwrap_or("none"),
         );
 
         let judged: JudgeResponse = self.generate_structured(prompt, judge_schema()).await?;
@@ -452,7 +451,7 @@ impl ExtractionProvider for OllamaClient {
             "NewType" => Ok(JudgeDecision::NewType),
             "Reject" => Ok(JudgeDecision::Reject),
             other => Err(ModelError::MalformedResponse(format!(
-                "decisão desconhecida: {other}"
+                "unknown decision: {other}"
             ))),
         }
     }
@@ -464,11 +463,11 @@ impl ExtractionProvider for OllamaClient {
         let canonical_concepts =
             "id, kind, status, depends_on, implements, supersedes, causes, owned_by, conflicts_with, documents, configures";
         let prompt = format!(
-            "As chaves de frontmatter abaixo vêm de um gerador de Spec-Driven \
-             Development desconhecido. Para cada chave, diga a qual conceito \
-             canônico ela corresponde ({canonical_concepts}), ou null se não \
-             corresponder a nenhum.\n\n\
-             Chaves: {}",
+            "The frontmatter keys below come from an unknown Spec-Driven \
+             Development generator. For each key, say which canonical \
+             concept it corresponds to ({canonical_concepts}), or null if it \
+             doesn't correspond to any.\n\n\
+             Keys: {}",
             keys.join(", ")
         );
 
@@ -483,8 +482,8 @@ impl ExtractionProvider for OllamaClient {
     }
 }
 
-/// Backend de modelo ativo — dispatch por enum, não por `dyn Trait` (evita
-/// custo de vtable numa chamada que já paga round-trip de subprocesso/HTTP).
+/// Active model backend — dispatch via enum, not `dyn Trait` (avoids the
+/// vtable cost on a call that already pays a subprocess/HTTP round-trip).
 pub enum ModelBackend {
     Embedded(LlamaCppRuntime),
     Ollama(OllamaClient),
@@ -504,21 +503,21 @@ impl EmbeddingProvider for ModelBackend {
 mod tests {
     use super::*;
 
-    /// Integração real contra Ollama local — pula (não falha) se o daemon
-    /// não estiver rodando ou o modelo `all-minilm` não estiver puxado.
-    /// `ollama pull all-minilm` (~46MB) antes de rodar localmente.
+    /// Real integration against local Ollama — skips (doesn't fail) if the
+    /// daemon isn't running or the `all-minilm` model hasn't been pulled.
+    /// Run `ollama pull all-minilm` (~46MB) before running locally.
     #[tokio::test]
-    async fn embed_via_ollama_real_retorna_vetor_nao_vazio() {
+    async fn embed_via_ollama_real_returns_non_empty_vector() {
         let client = OllamaClient::new("all-minilm");
         if !client.probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
-        let embedding = match client.embed("teste de embedding real").await {
+        let embedding = match client.embed("real embedding test").await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("modelo all-minilm indisponível ({e}) — pulando teste de integração");
+                eprintln!("all-minilm model unavailable ({e}) — skipping integration test");
                 return;
             }
         };
@@ -527,14 +526,14 @@ mod tests {
         assert_eq!(embedding.len(), kern_vector_embedding_dim_hint());
     }
 
-    /// Mantém o teste honesto sobre a dimensão esperada sem acoplar
-    /// kern-model a kern-vector (dependência de teste, não de produto).
+    /// Keeps the test honest about the expected dimension without coupling
+    /// kern-model to kern-vector (a test-only dependency, not a product one).
     fn kern_vector_embedding_dim_hint() -> usize {
         384
     }
 
-    /// Localiza `llama-server` no PATH sem depender de um path fixo de
-    /// instalação — CI e máquinas locais podem tê-lo em lugares diferentes.
+    /// Locates `llama-server` on PATH without depending on a fixed install
+    /// path — CI and local machines may have it in different places.
     fn find_llama_server_binary() -> Option<std::path::PathBuf> {
         let path_var = std::env::var_os("PATH")?;
         std::env::split_paths(&path_var)
@@ -542,8 +541,8 @@ mod tests {
             .find(|candidate| candidate.is_file())
     }
 
-    /// Modelo GGUF pequeno usado só pra testar o subprocesso de ponta a
-    /// ponta — não é o modelo de produção, só precisa suportar `--embedding`.
+    /// Small GGUF model used only to test the subprocess end to end — not
+    /// the production model, it just needs to support `--embedding`.
     fn find_test_gguf_model() -> Option<std::path::PathBuf> {
         let home = std::env::var_os("HOME")?;
         let path = std::path::PathBuf::from(home)
@@ -554,74 +553,74 @@ mod tests {
         path.is_file().then_some(path)
     }
 
-    /// Integração real: sobe `llama-server` como subprocesso de verdade e
-    /// chama `/v1/embeddings` nele. Pula (não falha) se o binário ou o
-    /// modelo de teste não estiverem disponíveis na máquina — CI de S5 não
-    /// depende de tê-los instalados (ver sprint-status.md).
+    /// Real integration: spawns `llama-server` as an actual subprocess and
+    /// calls `/v1/embeddings` on it. Skips (doesn't fail) if the binary or
+    /// the test model aren't available on the machine — CI doesn't depend
+    /// on having them installed.
     #[tokio::test]
-    async fn embed_via_llama_cpp_runtime_real_retorna_vetor_nao_vazio() {
+    async fn embed_via_llama_cpp_runtime_real_returns_non_empty_vector() {
         let Some(binary) = find_llama_server_binary() else {
-            eprintln!("llama-server não encontrado no PATH — pulando teste de integração");
+            eprintln!("llama-server not found on PATH — skipping integration test");
             return;
         };
         let Some(model) = find_test_gguf_model() else {
             eprintln!(
-                "modelo de teste ~/.cache/kern/models/bge-small-en-v1.5-q4_k_m.gguf \
-                 não encontrado — pulando teste de integração"
+                "test model ~/.cache/kern/models/bge-small-en-v1.5-q4_k_m.gguf \
+                 not found — skipping integration test"
             );
             return;
         };
 
         let runtime = LlamaCppRuntime::spawn(&binary, &model, 8791)
             .await
-            .expect("llama-server deveria subir e ficar pronto dentro do timeout");
+            .expect("llama-server should start and become ready within the timeout");
 
         let embedding = runtime
-            .embed("teste de embedding real via llama-server")
+            .embed("real embedding test via llama-server")
             .await
-            .expect("embed deveria retornar um vetor válido");
+            .expect("embed should return a valid vector");
 
         assert!(!embedding.is_empty());
     }
 
-    /// `ModelBackend::Embedded` deve delegar de verdade pro `LlamaCppRuntime`
-    /// — não é mais um stub de erro fixo (ver histórico: Sprint S5 removeu
-    /// o placeholder `BackendUnavailable`).
+    /// `ModelBackend::Embedded` should actually delegate to `LlamaCppRuntime`
+    /// — it's no longer a fixed error stub (the `BackendUnavailable`
+    /// placeholder was removed).
     #[tokio::test]
-    async fn model_backend_embedded_delega_para_llama_cpp_runtime_real() {
+    async fn model_backend_embedded_delegates_to_real_llama_cpp_runtime() {
         let Some(binary) = find_llama_server_binary() else {
-            eprintln!("llama-server não encontrado no PATH — pulando teste de integração");
+            eprintln!("llama-server not found on PATH — skipping integration test");
             return;
         };
         let Some(model) = find_test_gguf_model() else {
             eprintln!(
-                "modelo de teste ~/.cache/kern/models/bge-small-en-v1.5-q4_k_m.gguf \
-                 não encontrado — pulando teste de integração"
+                "test model ~/.cache/kern/models/bge-small-en-v1.5-q4_k_m.gguf \
+                 not found — skipping integration test"
             );
             return;
         };
 
         let runtime = LlamaCppRuntime::spawn(&binary, &model, 8792)
             .await
-            .expect("llama-server deveria subir e ficar pronto dentro do timeout");
+            .expect("llama-server should start and become ready within the timeout");
         let backend = ModelBackend::Embedded(runtime);
 
         let embedding = backend
-            .embed("teste via ModelBackend::Embedded")
+            .embed("test via ModelBackend::Embedded")
             .await
-            .expect("embed via ModelBackend deveria retornar um vetor válido");
+            .expect("embed via ModelBackend should return a valid vector");
 
         assert!(!embedding.is_empty());
     }
 
-    /// Integração real contra Ollama — `llama3.2` já é um modelo generativo
-    /// comum (ao contrário de `all-minilm`, embedding-only). Pula se
-    /// indisponível.
+    /// Real integration against Ollama — `llama3.2` is a common generative
+    /// model (unlike `all-minilm`, which is embedding-only). Skips if
+    /// unavailable.
     #[tokio::test]
-    async fn extract_via_ollama_real_encontra_entidades_mencionadas() {
+    async fn extract_via_ollama_real_finds_mentioned_entities() {
         let client = OllamaClient::new("llama3.2");
         if !client.probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
@@ -630,21 +629,21 @@ mod tests {
         };
         let candidates = match client
             .extract(
-                "kern-ontology depende de kern-model para gerar embeddings.",
+                "kern-ontology depends on kern-model to generate embeddings.",
                 &vocab,
             )
             .await
         {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("modelo llama3.2 indisponível ({e}) — pulando teste de integração");
+                eprintln!("llama3.2 model unavailable ({e}) — skipping integration test");
                 return;
             }
         };
 
         assert!(
             !candidates.is_empty(),
-            "esperava ao menos 1 candidato extraído"
+            "expected at least 1 extracted candidate"
         );
         assert!(candidates
             .iter()
@@ -652,10 +651,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn judge_via_ollama_real_retorna_uma_decisao_valida() {
+    async fn judge_via_ollama_real_returns_a_valid_decision() {
         let client = OllamaClient::new("llama3.2");
         if !client.probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
@@ -665,20 +664,20 @@ mod tests {
         };
         let nearest = vec![EntityType {
             name: "kern-ingest".to_string(),
-            description: "crate de ingestão e chunking".to_string(),
+            description: "ingestion and chunking crate".to_string(),
         }];
 
         let decision = match client.judge(&candidate, &nearest).await {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("modelo llama3.2 indisponível ({e}) — pulando teste de integração");
+                eprintln!("llama3.2 model unavailable ({e}) — skipping integration test");
                 return;
             }
         };
 
-        // Qualquer uma das 3 é uma resposta estruturalmente válida — o que
-        // este teste garante é que o pipeline HTTP + schema + parse funciona
-        // de ponta a ponta contra um modelo real, não qual decisão sai.
+        // Any of the 3 is a structurally valid response — what this test
+        // guarantees is that the HTTP + schema + parse pipeline works end
+        // to end against a real model, not which decision comes out.
         assert!(matches!(
             decision,
             JudgeDecision::Merge | JudgeDecision::NewType | JudgeDecision::Reject
@@ -686,10 +685,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interpret_frontmatter_schema_via_ollama_real_mapeia_chaves_obvias() {
+    async fn interpret_frontmatter_schema_via_ollama_real_maps_obvious_keys() {
         let client = OllamaClient::new("llama3.2");
         if !client.probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
@@ -697,17 +696,17 @@ mod tests {
             "id".to_string(),
             "kind".to_string(),
             "depends_on".to_string(),
-            "cor_favorita".to_string(),
+            "favorite_color".to_string(),
         ];
         let mapping = match client.interpret_frontmatter_schema(&keys).await {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("modelo llama3.2 indisponível ({e}) — pulando teste de integração");
+                eprintln!("llama3.2 model unavailable ({e}) — skipping integration test");
                 return;
             }
         };
 
-        assert_eq!(mapping.len(), keys.len(), "esperava uma entrada por chave");
+        assert_eq!(mapping.len(), keys.len(), "expected one entry per key");
         assert_eq!(mapping.get("id").cloned().flatten().as_deref(), Some("id"));
         assert_eq!(
             mapping.get("depends_on").cloned().flatten().as_deref(),

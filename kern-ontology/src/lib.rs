@@ -1,6 +1,7 @@
-//! kern-ontology — type registry, vocabulário de relação, motor de diff
-//! incremental. O core subdomain do projeto (ver docs/domain/ontologia/ no
-//! workspace de delivery) — é o que a taxa de fallback do `judge()` mede.
+//! kern-ontology — type registry, relation vocabulary, incremental diff
+//! engine. The core subdomain of the project (design rationale kept in the
+//! maintainer's private delivery workspace, not published in this repo) —
+//! this is what the fallback rate of `judge()` measures.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,38 +21,37 @@ pub use sqlite::{
     SqliteFrontmatterProfileRepository, SqliteInstanceRepository, SqliteTypeRepository,
 };
 
-// kern-model é dependência declarada no Cargo.toml deste crate — usada a
-// partir de S3-BKD-04 (CandidateEntity, EntityType, JudgeDecision nas
-// assinaturas de OntologyEngine::process_candidate).
+// kern-model is a dependency declared in this crate's Cargo.toml — used
+// for CandidateEntity, EntityType, JudgeDecision in the signatures of
+// OntologyEngine::process_candidate.
 
 #[derive(Debug, Error)]
 pub enum OntologyError {
-    #[error("entidade não encontrada: {0}")]
+    #[error("entity not found: {0}")]
     EntityNotFound(Uuid),
-    #[error("tipo de relação não encontrado: {0}")]
+    #[error("relation type not found: {0}")]
     RelationTypeNotFound(String),
-    #[error("candidato na zona ambígua sem decisão do judge")]
+    #[error("candidate in the ambiguous zone without a judge decision")]
     JudgeUndecided,
-    #[error("erro do provedor de modelo: {0}")]
+    #[error("model provider error: {0}")]
     Model(#[from] kern_model::ModelError),
-    #[error("erro do SQLite: {0}")]
+    #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("falha ao abrir banco em {path}: {reason}")]
+    #[error("failed to open database at {path}: {reason}")]
     OpenFailed { path: String, reason: String },
-    #[error("tarefa de banco cancelada/pane: {0}")]
+    #[error("database task cancelled/panicked: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
 }
 
-/// Status de um `RelationType` — ver Agregado 1 em
-/// docs/domain/ontologia/aggregates.md (workspace de delivery).
+/// Status of a `RelationType`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelationTypeStatus {
     Candidate,
     Canonical,
 }
 
-/// Threshold de N hits independentes até promoção a canônico — fechado em 3
-/// (docs/domain/ontologia/aggregates.md).
+/// Threshold of independent-hit count required before promotion to
+/// canonical — fixed at 3.
 pub const PROMOTION_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,8 +72,8 @@ pub struct RelationTypeRecord {
     pub instance_count: u64,
 }
 
-/// Os 8 tipos canônicos semeados no boot do projeto — não passam por
-/// promoção (docs/domain/ontologia/aggregates.md, Agregado 1, invariante 3).
+/// The 8 canonical types seeded at project boot — they never go through
+/// promotion.
 pub const SEED_RELATION_TYPES: [&str; 8] = [
     "depends_on",
     "supersedes",
@@ -85,14 +85,13 @@ pub const SEED_RELATION_TYPES: [&str; 8] = [
     "configures",
 ];
 
-/// Port: persistência do Agregado 1 (Registro de Tipos). Adapter real
-/// (`SqliteTypeRepository`) fica atrás deste trait — ver docs/adr/0004.
+/// Port: persistence for the Type Registry aggregate. The real adapter
+/// (`SqliteTypeRepository`) sits behind this trait.
 #[async_trait]
 pub trait TypeRepository: Send + Sync {
     async fn seed_canonical_vocabulary(&self) -> Result<(), OntologyError>;
-    /// Tipos de entidade não passam pelo fluxo de promoção curada dos tipos
-    /// de relação (docs/domain/ontologia/aggregates.md não define threshold
-    /// pra entity types) — get-or-create simples.
+    /// Entity types don't go through the curated promotion flow that
+    /// relation types do — simple get-or-create.
     async fn find_or_create_entity_type(
         &self,
         name: &str,
@@ -102,27 +101,26 @@ pub trait TypeRepository: Send + Sync {
         &self,
         name: &str,
     ) -> Result<Option<RelationTypeRecord>, OntologyError>;
-    /// Get-or-create: se `name` já existe (candidate ou canonical), retorna
-    /// o registro existente sem duplicar.
+    /// Get-or-create: if `name` already exists (candidate or canonical),
+    /// returns the existing record without duplicating it.
     async fn register_candidate_type(
         &self,
         name: &str,
         description: &str,
     ) -> Result<RelationTypeRecord, OntologyError>;
-    /// Registra que `type_id` apareceu em `file_path` — deduplicado por
-    /// arquivo (hits de arquivos diferentes, nunca o mesmo arquivo contado
-    /// duas vezes). Retorna a contagem de arquivos independentes após o
-    /// registro.
+    /// Records that `type_id` appeared in `file_path` — deduplicated by
+    /// file (hits from different files, never the same file counted
+    /// twice). Returns the count of independent files after recording.
     async fn record_independent_hit(
         &self,
         type_id: Uuid,
         file_path: &str,
     ) -> Result<u32, OntologyError>;
     async fn promote_to_canonical(&self, type_id: Uuid) -> Result<(), OntologyError>;
-    /// Usado por `get_ontology_schema` (kern-mcp).
+    /// Used by `get_ontology_schema` (kern-mcp).
     async fn list_entity_types(&self) -> Result<Vec<EntityTypeRecord>, OntologyError>;
-    /// Usado por `get_ontology_schema` (kern-mcp) e pelo roteamento semântico
-    /// de `query_ontological`.
+    /// Used by `get_ontology_schema` (kern-mcp) and by the semantic
+    /// routing of `query_ontological`.
     async fn list_relation_types(&self) -> Result<Vec<RelationTypeRecord>, OntologyError>;
 }
 
@@ -131,7 +129,7 @@ pub struct EntityRecord {
     pub id: Uuid,
     pub type_id: Uuid,
     pub canonical_name: String,
-    /// Imutável após a criação (docs/domain/ontologia/aggregates.md, Agregado 2, invariante 2).
+    /// Immutable after creation.
     pub first_seen_file: String,
     pub updated_at: String,
 }
@@ -143,11 +141,11 @@ pub struct RelationRecord {
     pub source_entity_id: Uuid,
     pub target_entity_id: Uuid,
     pub confidence: f32,
-    /// Nunca nulo — toda relação cita evidência (docs/domain/ontologia/aggregates.md, Agregado 2, invariante 3).
+    /// Never null — every relation cites evidence.
     pub evidence_chunk_id: Uuid,
 }
 
-/// Port: persistência do Agregado 2 (Grafo de Instâncias).
+/// Port: persistence for the Instance Graph aggregate.
 #[async_trait]
 pub trait InstanceRepository: Send + Sync {
     async fn find_or_create_entity(
@@ -162,29 +160,28 @@ pub trait InstanceRepository: Send + Sync {
         entity_id: Uuid,
         depth: u32,
     ) -> Result<Vec<EntityRecord>, OntologyError>;
-    /// Usado por `query_by_concept` (kern-mcp) — busca por substring
-    /// case-insensitive no nome canônico, não match exato só.
+    /// Used by `query_by_concept` (kern-mcp) — case-insensitive substring
+    /// search on the canonical name, not just an exact match.
     async fn find_entities_by_name(
         &self,
         name_query: &str,
     ) -> Result<Vec<EntityRecord>, OntologyError>;
-    /// Usado por `explain_relation` (kern-mcp) — caminho mais curto (BFS)
-    /// entre duas entidades, com as relações percorridas em ordem. `None`
-    /// se não houver caminho até `max_depth` saltos.
+    /// Used by `explain_relation` (kern-mcp) — shortest path (BFS)
+    /// between two entities, with the traversed relations in order.
+    /// `None` if there is no path within `max_depth` hops.
     async fn find_path(
         &self,
         from: Uuid,
         to: Uuid,
         max_depth: u32,
     ) -> Result<Option<Vec<RelationRecord>>, OntologyError>;
-    /// Usado por `query_by_concept` (kern-mcp) — as arestas onde a entidade
-    /// é origem ou alvo, não só os vizinhos resultantes.
+    /// Used by `query_by_concept` (kern-mcp) — the edges where the entity
+    /// is either source or target, not just the resulting neighbors.
     async fn direct_relations(&self, entity_id: Uuid)
         -> Result<Vec<RelationRecord>, OntologyError>;
 }
 
-/// Decisão do motor de ontologia pra um candidato — ver
-/// docs/domain/ontologia/event-storming.md, passo 3.
+/// Decision made by the ontology engine for a candidate.
 #[derive(Debug, Clone)]
 pub enum ClassificationOutcome {
     Merged {
@@ -201,9 +198,8 @@ pub enum ClassificationOutcome {
     },
 }
 
-/// Threshold da zona ambígua — placeholder documentado, não-final (ver
-/// docs/domain/ontologia/aggregates.md e docs/adr/0004 no workspace de
-/// delivery). Configurável via TOML na implementação real.
+/// Ambiguous zone threshold — documented placeholder, not final.
+/// Configurable via TOML in the real implementation.
 #[derive(Debug, Clone, Copy)]
 pub struct AmbiguousZoneConfig {
     pub low_distance_max: f32,
@@ -219,18 +215,35 @@ impl Default for AmbiguousZoneConfig {
     }
 }
 
-/// Motor de decisão real — recebe um candidato + a distância de embedding
-/// contra o tipo mais próximo já existente, decide merge/novo-tipo/judge sem
-/// chamar `ExtractionProvider::judge()` fora da zona ambígua (é o que
-/// mantém a taxa de fallback baixa — KPI North Star do projeto).
+/// The real decision engine — takes a candidate + the embedding distance
+/// against the closest existing type, decides merge/new-type/judge without
+/// calling `ExtractionProvider::judge()` outside the ambiguous zone (this
+/// is what keeps the fallback rate low — the project's North Star KPI).
 pub struct OntologyEngine {
     types: std::sync::Arc<dyn TypeRepository>,
     instances: std::sync::Arc<dyn InstanceRepository>,
     extraction: std::sync::Arc<dyn kern_model::ExtractionProvider>,
     frontmatter_profiles: std::sync::Arc<dyn FrontmatterProfileRepository>,
+    /// Used only to find the closest entity type for a candidate
+    /// (`nearest_entity_type`) — never to embed chunks, that's the
+    /// responsibility of kern-ingest/kern-vector.
+    embedder: std::sync::Arc<dyn kern_model::EmbeddingProvider>,
     zone: AmbiguousZoneConfig,
-    /// Taxa de fallback para o judge() — KPI North Star (docs/adr/0005).
+    /// Fallback rate for judge() — North Star KPI.
     pub metrics: std::sync::Arc<FallbackMetrics>,
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
 }
 
 impl OntologyEngine {
@@ -239,6 +252,7 @@ impl OntologyEngine {
         instances: std::sync::Arc<dyn InstanceRepository>,
         extraction: std::sync::Arc<dyn kern_model::ExtractionProvider>,
         frontmatter_profiles: std::sync::Arc<dyn FrontmatterProfileRepository>,
+        embedder: std::sync::Arc<dyn kern_model::EmbeddingProvider>,
         zone: AmbiguousZoneConfig,
     ) -> Self {
         Self {
@@ -246,19 +260,84 @@ impl OntologyEngine {
             instances,
             extraction,
             frontmatter_profiles,
+            embedder,
             zone,
             metrics: std::sync::Arc::new(FallbackMetrics::new()),
         }
     }
 
-    /// Ver docs/domain/ontologia/event-storming.md, passo 3:
-    /// - distância baixa -> funde direto (sem judge)
-    /// - distância alta -> cria tipo novo direto (sem judge)
-    /// - zona ambígua -> chama judge() (único caminho caro)
+    /// Real entry point of ingestion: extracts candidates from the chunk,
+    /// finds the distance of each one against the closest already-known
+    /// entity type, and applies the decision via `process_candidate`.
+    /// Prose-based extraction only — the frontmatter-driven path
+    /// (`learn_or_reuse_frontmatter_profile`) is a separate dimension,
+    /// not yet wired into this method.
+    pub async fn process_chunk(
+        &self,
+        chunk_content: &str,
+        file_path: &str,
+    ) -> Result<Vec<ClassificationOutcome>, OntologyError> {
+        let vocab = kern_model::RelationVocabulary {
+            canonical_types: self
+                .types
+                .list_relation_types()
+                .await?
+                .into_iter()
+                .map(|t| t.name)
+                .collect(),
+        };
+        let candidates = self.extraction.extract(chunk_content, &vocab).await?;
+
+        let mut outcomes = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let (distance, nearest) = self.nearest_entity_type(&candidate).await?;
+            let outcome = self
+                .process_candidate(candidate, distance, nearest.as_ref(), file_path)
+                .await?;
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
+
+    /// Embedding distance between the candidate and the closest existing
+    /// entity type — input for `process_candidate`. With no existing
+    /// types yet, returns the maximum distance (forces creation of a new
+    /// type, never a merge with nothing to compare against).
+    async fn nearest_entity_type(
+        &self,
+        candidate: &kern_model::CandidateEntity,
+    ) -> Result<(f32, Option<EntityTypeRecord>), OntologyError> {
+        let entity_types = self.types.list_entity_types().await?;
+        if entity_types.is_empty() {
+            return Ok((1.0, None));
+        }
+
+        let probe_text = candidate
+            .raw_type_hint
+            .as_deref()
+            .unwrap_or(&candidate.raw_name);
+        let candidate_embedding = self.embedder.embed(probe_text).await?;
+
+        let mut best: Option<(EntityTypeRecord, f32)> = None;
+        for entity_type in entity_types {
+            let desc_embedding = self.embedder.embed(&entity_type.description).await?;
+            let distance = 1.0 - cosine_similarity(&candidate_embedding, &desc_embedding);
+            if best.as_ref().map(|(_, d)| distance < *d).unwrap_or(true) {
+                best = Some((entity_type, distance));
+            }
+        }
+        let (entity_type, distance) = best.expect("entity_types is not empty in this branch");
+        Ok((distance, Some(entity_type)))
+    }
+
+    /// Decision logic:
+    /// - low distance -> merges directly (no judge)
+    /// - high distance -> creates a new type directly (no judge)
+    /// - ambiguous zone -> calls judge() (the only costly path)
     ///
-    /// Um span por caso de uso (docs/adr/0005) — `bc` identifica a Bounded
-    /// Context pra correlação em rastros distribuídos.
-    #[tracing::instrument(skip(self, candidate), fields(bc = "ontologia", candidate = %candidate.raw_name))]
+    /// One span per use case — `bc` identifies the Bounded Context for
+    /// correlation across distributed traces.
+    #[tracing::instrument(skip(self, candidate), fields(bc = "ontology", candidate = %candidate.raw_name))]
     pub async fn process_candidate(
         &self,
         candidate: kern_model::CandidateEntity,
@@ -269,7 +348,7 @@ impl OntologyEngine {
         if distance_to_nearest <= self.zone.low_distance_max {
             let nearest = nearest_type.ok_or_else(|| {
                 OntologyError::RelationTypeNotFound(
-                    "distância baixa reportada sem tipo mais próximo".to_string(),
+                    "low distance reported without a nearest type".to_string(),
                 )
             })?;
             let entity = self
@@ -289,7 +368,7 @@ impl OntologyEngine {
             return outcome;
         }
 
-        // Zona ambígua — único caminho que paga o custo do judge().
+        // Ambiguous zone — the only path that pays the cost of judge().
         let nearest_hint = nearest_type
             .map(|t| {
                 vec![kern_model::EntityType {
@@ -326,7 +405,7 @@ impl OntologyEngine {
                 }
             }
             kern_model::JudgeDecision::Reject => Ok(ClassificationOutcome::Rejected {
-                reason: format!("judge() rejeitou candidato '{}'", candidate.raw_name),
+                reason: format!("judge() rejected candidate '{}'", candidate.raw_name),
             }),
         };
         self.metrics.record(true);
@@ -346,7 +425,7 @@ impl OntologyEngine {
             .types
             .find_or_create_entity_type(
                 &type_name,
-                &format!("tipo inferido a partir de '{}'", candidate.raw_name),
+                &format!("type inferred from '{}'", candidate.raw_name),
             )
             .await?;
         let entity = self
@@ -360,10 +439,10 @@ impl OntologyEngine {
         })
     }
 
-    /// Registra que `relation_type_name` apareceu em `file_path` e promove a
-    /// canônico se atingir `PROMOTION_THRESHOLD` arquivos independentes. Get-
-    /// or-create do tipo candidato: chamar isso pra um tipo que não existe
-    /// ainda o cria como candidate.
+    /// Registers that `relation_type_name` appeared in `file_path` and
+    /// promotes it to canonical once it reaches `PROMOTION_THRESHOLD`
+    /// independent files. Get-or-create for the candidate type: calling
+    /// this for a type that doesn't exist yet creates it as a candidate.
     pub async fn evaluate_promotion(
         &self,
         relation_type_name: &str,
@@ -395,11 +474,10 @@ impl OntologyEngine {
         Ok(record)
     }
 
-    /// Fluxo de duas etapas do frontmatter (docs/domain/ontologia — seção
-    /// "Dando Sentido à Ontologia"): parse determinístico primeiro, LLM só
-    /// na primeira ocorrência de uma forma nova. `None` se o arquivo não tem
-    /// frontmatter — cai pro fallback de extração via prosa (fora deste
-    /// método).
+    /// Two-step frontmatter flow: deterministic parse first, LLM only on
+    /// the first occurrence of a new shape. `None` if the file has no
+    /// frontmatter — falls back to prose-based extraction (outside this
+    /// method).
     pub async fn learn_or_reuse_frontmatter_profile(
         &self,
         file_path: &std::path::Path,
@@ -415,7 +493,7 @@ impl OntologyEngine {
             return Ok(Some(cached));
         }
 
-        // Primeira ocorrência desta forma neste escopo — única chamada cara.
+        // First occurrence of this shape in this scope — the only expensive call.
         let field_mapping = self.extraction.interpret_frontmatter_schema(&keys).await?;
         let profile = FrontmatterProfile {
             id: Uuid::new_v4(),
@@ -445,23 +523,26 @@ mod engine_tests {
             Arc::new(OllamaClient::new("llama3.2"));
         let frontmatter_profiles: Arc<dyn FrontmatterProfileRepository> =
             Arc::new(SqliteFrontmatterProfileRepository::open(&db_path).unwrap());
+        let embedder: Arc<dyn kern_model::EmbeddingProvider> =
+            Arc::new(OllamaClient::new("all-minilm"));
         OntologyEngine::new(
             types,
             instances,
             extraction,
             frontmatter_profiles,
+            embedder,
             AmbiguousZoneConfig::default(),
         )
     }
 
     #[tokio::test]
-    async fn distancia_baixa_funde_sem_chamar_judge() {
+    async fn low_distance_merges_without_calling_judge() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
 
         let existing_type = engine
             .types
-            .find_or_create_entity_type("Crate", "um crate do workspace kern")
+            .find_or_create_entity_type("Crate", "a crate from the kern workspace")
             .await
             .unwrap();
 
@@ -480,15 +561,15 @@ mod engine_tests {
                 judge_called,
                 entity,
             } => {
-                assert!(!judge_called, "distância baixa não deveria chamar judge()");
+                assert!(!judge_called, "low distance shouldn't call judge()");
                 assert_eq!(entity.type_id, existing_type.id);
             }
-            other => panic!("esperava Merged, veio {other:?}"),
+            other => panic!("expected Merged, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn distancia_alta_cria_tipo_novo_sem_chamar_judge() {
+    async fn high_distance_creates_new_type_without_calling_judge() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
 
@@ -508,19 +589,19 @@ mod engine_tests {
                 entity_type,
                 ..
             } => {
-                assert!(!judge_called, "distância alta não deveria chamar judge()");
+                assert!(!judge_called, "high distance shouldn't call judge()");
                 assert_eq!(entity_type.name, "Crate");
             }
-            other => panic!("esperava NewType, veio {other:?}"),
+            other => panic!("expected NewType, got {other:?}"),
         }
     }
 
-    /// Integração real contra Ollama (llama3.2) — pula se indisponível.
+    /// Real integration against Ollama (llama3.2) — skips if unavailable.
     #[tokio::test]
-    async fn zona_ambigua_chama_judge_e_aplica_a_decisao() {
+    async fn ambiguous_zone_calls_judge_and_applies_the_decision() {
         let probe = OllamaClient::new("llama3.2");
         if !probe.probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
@@ -529,7 +610,7 @@ mod engine_tests {
 
         let existing_type = engine
             .types
-            .find_or_create_entity_type("Crate", "um crate Rust do workspace")
+            .find_or_create_entity_type("Crate", "a Rust crate from the workspace")
             .await
             .unwrap();
 
@@ -538,7 +619,7 @@ mod engine_tests {
             raw_type_hint: Some("Crate".to_string()),
         };
 
-        // Distância no meio da zona ambígua (default: 0.15..0.35).
+        // Distance in the middle of the ambiguous zone (default: 0.15..0.35).
         let outcome = engine
             .process_candidate(candidate, 0.25, Some(&existing_type), "docs/c.md")
             .await
@@ -556,12 +637,12 @@ mod engine_tests {
         );
         assert!(
             judge_was_called,
-            "zona ambígua deveria ter chamado judge(): {outcome:?}"
+            "ambiguous zone should have called judge(): {outcome:?}"
         );
     }
 
     #[tokio::test]
-    async fn evaluate_promotion_promove_apos_threshold_via_engine() {
+    async fn evaluate_promotion_promotes_after_threshold_via_engine() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
 
@@ -569,7 +650,7 @@ mod engine_tests {
         for i in 0..PROMOTION_THRESHOLD {
             last = Some(
                 engine
-                    .evaluate_promotion("influences", "tipo emergente", &format!("doc-{i}.md"))
+                    .evaluate_promotion("influences", "emergent type", &format!("doc-{i}.md"))
                     .await
                     .unwrap(),
             );
@@ -579,12 +660,12 @@ mod engine_tests {
     }
 
     #[tokio::test]
-    async fn evaluate_promotion_nao_promove_antes_do_threshold() {
+    async fn evaluate_promotion_does_not_promote_before_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
 
         let record = engine
-            .evaluate_promotion("influences", "tipo emergente", "doc-0.md")
+            .evaluate_promotion("influences", "emergent type", "doc-0.md")
             .await
             .unwrap();
 
@@ -592,14 +673,14 @@ mod engine_tests {
     }
 
     #[tokio::test]
-    async fn arquivo_sem_frontmatter_retorna_none() {
+    async fn file_without_frontmatter_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
 
         let result = engine
             .learn_or_reuse_frontmatter_profile(
-                std::path::Path::new("docs/livre.md"),
-                "# Sem frontmatter\nsó prosa.\n",
+                std::path::Path::new("docs/freeform.md"),
+                "# No frontmatter\njust prose.\n",
             )
             .await
             .unwrap();
@@ -607,21 +688,21 @@ mod engine_tests {
         assert!(result.is_none());
     }
 
-    /// Integração real contra Ollama — primeira chamada aprende (chama o
-    /// extrator), segunda chamada com a MESMA forma reusa o cache sem
-    /// chamar o extrator de novo (verificado indiretamente: o id do perfil
-    /// retornado é idêntico nas duas chamadas).
+    /// Real integration against Ollama — the first call learns (calls the
+    /// extractor), the second call with the SAME shape reuses the cache
+    /// without calling the extractor again (verified indirectly: the
+    /// returned profile id is identical across both calls).
     #[tokio::test]
-    async fn segunda_ocorrencia_da_mesma_forma_reusa_o_perfil_cacheado() {
+    async fn second_occurrence_of_the_same_shape_reuses_the_cached_profile() {
         let probe = OllamaClient::new("llama3.2");
         if !probe.probe().await {
-            eprintln!("Ollama não está rodando em :11434 — pulando teste de integração");
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
             return;
         }
 
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
-        let content = "---\nid: TASK-0001\nkind: task\ndepends_on: [TASK-0000]\n---\n\n# Tarefa\n";
+        let content = "---\nid: TASK-0001\nkind: task\ndepends_on: [TASK-0000]\n---\n\n# Task\n";
 
         let first = engine
             .learn_or_reuse_frontmatter_profile(
@@ -630,20 +711,20 @@ mod engine_tests {
             )
             .await
             .unwrap()
-            .expect("deveria aprender um perfil na primeira ocorrência");
+            .expect("should learn a profile on the first occurrence");
 
         let second = engine
             .learn_or_reuse_frontmatter_profile(
-                std::path::Path::new(".specify/specs/b.md"), // arquivo diferente, mesma forma
+                std::path::Path::new(".specify/specs/b.md"), // different file, same shape
                 content,
             )
             .await
             .unwrap()
-            .expect("deveria reusar o perfil cacheado na segunda ocorrência");
+            .expect("should reuse the cached profile on the second occurrence");
 
         assert_eq!(
             first.id, second.id,
-            "mesma forma no mesmo escopo deveria reusar o perfil, não aprender de novo"
+            "same shape in the same scope should reuse the profile, not learn again"
         );
         assert_eq!(
             first.field_mapping.get("id").cloned().flatten().as_deref(),
@@ -652,18 +733,18 @@ mod engine_tests {
     }
 
     #[tokio::test]
-    async fn metrica_de_fallback_reflete_chamadas_reais_ao_judge() {
+    async fn fallback_metric_reflects_real_calls_to_judge() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine(dir.path());
         assert_eq!(engine.metrics.fallback_rate(), 0.0);
 
         let existing_type = engine
             .types
-            .find_or_create_entity_type("Crate", "um crate")
+            .find_or_create_entity_type("Crate", "a crate")
             .await
             .unwrap();
 
-        // 2 candidatos fora da zona ambígua — sem custo de judge().
+        // 2 candidates outside the ambiguous zone — no cost from judge().
         for name in ["kern-a", "kern-b"] {
             engine
                 .process_candidate(
@@ -671,7 +752,7 @@ mod engine_tests {
                         raw_name: name.to_string(),
                         raw_type_hint: Some("Crate".to_string()),
                     },
-                    0.05, // distância baixa
+                    0.05, // low distance
                     Some(&existing_type),
                     "docs/x.md",
                 )
@@ -682,5 +763,71 @@ mod engine_tests {
         assert_eq!(engine.metrics.total(), 2);
         assert_eq!(engine.metrics.fallback_total(), 0);
         assert_eq!(engine.metrics.fallback_rate(), 0.0);
+    }
+
+    /// Real end-to-end integration: extract() via Ollama over a real
+    /// prose chunk, distance computed against an already-existing entity
+    /// type via real embedding, decision applied — the path that
+    /// catch_up_scan (kern-cli) now exercises on every chunk. Skips if
+    /// Ollama is unavailable.
+    #[tokio::test]
+    async fn process_chunk_extracts_and_classifies_candidates_via_real_ollama() {
+        let probe = OllamaClient::new("llama3.2");
+        if !probe.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+        engine
+            .types
+            .find_or_create_entity_type("Crate", "a Rust crate from the kern workspace")
+            .await
+            .unwrap();
+
+        let outcomes = engine
+            .process_chunk(
+                "kern-ontology is the crate that implements the incremental ontology engine.",
+                "docs/ontology.md",
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !outcomes.is_empty(),
+            "expected at least one classified candidate"
+        );
+    }
+
+    /// With no entity type existing yet, the first candidate never merges
+    /// (there's nothing to compare against) — it always creates a new
+    /// type.
+    #[tokio::test]
+    async fn process_chunk_with_no_existing_types_creates_new_type() {
+        let probe = OllamaClient::new("llama3.2");
+        if !probe.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path());
+
+        let outcomes = engine
+            .process_chunk(
+                "kern-vector wraps embedded LanceDB for vector indexing.",
+                "docs/vector.md",
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcomes.is_empty());
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, ClassificationOutcome::NewType { .. })),
+            "with no existing types, every candidate should create a new type: {outcomes:?}"
+        );
     }
 }

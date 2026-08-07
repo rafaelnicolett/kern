@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/mascot.jpg" alt="kern mascot" width="360">
+</p>
+
 # kern
 
 [![CI](https://github.com/rafaelnicolett/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/rafaelnicolett/kern/actions/workflows/ci.yml)
@@ -55,8 +59,8 @@ A single binary watches the folder, chunks and embeds new or changed
 content, and keeps the vector index up to date. Only when a candidate
 entity falls into the ambiguous zone against the existing ontology does it
 ask a local model to decide: merge into an existing type, promote to a new
-one, or discard. See [`docs/adr`](docs/adr) in the delivery workspace for
-the full history of architecture decisions.
+one, or discard. See [`docs/adr`](docs/adr) for the architecture decision
+history.
 
 ### Model backend
 
@@ -133,9 +137,18 @@ kern status --project acme
 launched by an MCP host, not run interactively in a terminal you're typing
 into. See below for wiring it up.
 
-**v0 acceptance target**: install, point at a real Markdown folder, and get
-a useful `query_ontological` response in about 2 minutes — dominated by the
-one-time model download, not by setup friction.
+Before the first `serve`, resolve a model backend per the
+[Model backend](#model-backend) section above: either `ollama pull
+all-minilm` (and optionally `llama3.2`), or a manually cached `.gguf` for
+the embedded path — `kern serve` has nothing to fall back on otherwise, and
+fails with a clear error rather than hanging.
+
+**v0 target**: once model resolution is fully automatic (no manual `ollama
+pull` or manual `.gguf` placement needed), install-to-useful-`query_ontological`-response
+should take about 2 minutes, dominated by the one-time model download, not
+by setup friction. That's the design target this v0 is built toward — it
+isn't there yet (see [Model backend](#model-backend)), so budget a few extra
+manual minutes today for pulling or placing a model first.
 
 ### Connecting an MCP host
 
@@ -174,7 +187,7 @@ binary with `serve --project <name>` as arguments.
 
 See
 [`docs/architecture/mcp-tool-contract.md`](docs/architecture/mcp-tool-contract.md)
-in the delivery workspace for the full contract.
+for the full contract.
 
 ## v0 scope
 
@@ -182,7 +195,8 @@ in the delivery workspace for the full contract.
    LanceDB, embedding via a local subprocess).
 2. An incremental ontology engine with three outcomes per candidate
    (merge / new type / judge), with a fallback-rate metric exposed via
-   structured logs and OpenTelemetry.
+   structured logs and traces (`tracing` crate — not yet wired to an
+   OpenTelemetry exporter, see [ADR-0005](docs/adr/0005-observability-from-v0.md)).
 3. MCP over stdio, with the six tools above.
 4. A minimal CLI: `project create`, `serve`, `status`.
 
@@ -202,8 +216,8 @@ kern-mcp/        MCP server (rmcp) exposing the agent-facing tools
 kern-cli/        the `kern` binary: project create, serve, status
 ```
 
-Hexagonal architecture (ports & adapters), traits-first — see `docs/adr/`
-in the delivery workspace for the decision history.
+Hexagonal architecture (ports & adapters), traits-first — see [`docs/adr/`](docs/adr)
+for the decision history.
 
 ## Contributing
 
@@ -220,4 +234,4 @@ your option — the Rust ecosystem default.
 
 ---
 
-<sub>Powered by Helyx.</sub>
+<sub>Powered by [Helyx](https://helyx.build).</sub>

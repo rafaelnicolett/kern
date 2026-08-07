@@ -7,11 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Build de referência do llama.cpp usada pra montar o pacote embarcado —
-  # pinada explicitamente (nunca "latest" solto no momento do build, ver
-  # Skill lang-rust / rust-toolchain.toml pro mesmo racional aplicado ao
-  # Rust). Atualizar aqui é uma decisão deliberada, testada manualmente
-  # antes do bump.
+  # Reference llama.cpp build used to assemble the bundled package — pinned
+  # explicitly (never a loose "latest" at build time, same rationale as
+  # rust-toolchain.toml). Bumping this is a deliberate decision, tested
+  # manually before the bump.
   LLAMA_CPP_RELEASE_TAG: b10298
 
 jobs:
@@ -22,15 +21,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux arm64 e Windows ficam de fora deste v0 — llama-server
-          # nesses alvos precisa de verificação própria (empacotamento de
-          # DLL no Windows, runner arm64 hospedado no Linux) que não foi
-          # feita ainda. Ver sprint-status.md, Sprint S5: escopo parcial
-          # deliberado, não descope.
-          - os: macos-14 # Apple Silicon nativo
+          # Linux arm64 and Windows are out of scope for this v0 —
+          # llama-server on those targets needs its own verification (DLL
+          # packaging on Windows, a Linux-hosted arm64 runner) not done yet.
+          # Deliberate partial scope, not a descope.
+          - os: macos-14 # native Apple Silicon
             target: aarch64-apple-darwin
             llama_asset_suffix: macos-arm64
-          - os: macos-13 # Intel nativo
+          - os: macos-13 # native Intel
             target: x86_64-apple-darwin
             llama_asset_suffix: macos-x64
           - os: ubuntu-24.04
@@ -39,12 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # lance-encoding (dependência transitiva via lancedb) compila .proto
-      # com prost-build em build.rs — exige o binário `protoc` no PATH, os
-      # runners do GitHub não vêm com ele por padrão (mesmo achado do
-      # ci.yml: build local funcionava só porque já tinha protoc via
-      # Homebrew nesta máquina).
-      - name: Instalar protoc (protobuf-compiler)
+      # lance-encoding (a transitive dependency via lancedb) compiles .proto
+      # files with prost-build in build.rs — it needs the `protoc` binary on
+      # PATH, and the GitHub runners don't ship it by default (same finding
+      # as ci.yml: local builds only worked because protoc was already on
+      # this machine via Homebrew).
+      - name: Install protoc (protobuf-compiler)
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
@@ -53,25 +51,25 @@ jobs:
             brew install protobuf
           fi
 
-      - name: Instalar toolchain pinado
+      - name: Install pinned toolchain
         run: rustup show
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "kern-release-${{ matrix.target }}"
 
-      - name: Baixar e extrair o release do llama.cpp para esta plataforma
+      - name: Download and extract the llama.cpp release for this platform
         shell: bash
         run: |
           set -euo pipefail
           asset="llama-${LLAMA_CPP_RELEASE_TAG}-bin-${{ matrix.llama_asset_suffix }}.tar.gz"
           url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE_TAG}/${asset}"
-          echo "baixando ${url}"
+          echo "downloading ${url}"
           curl -sL --fail -o /tmp/llama-release.tar.gz "${url}"
           mkdir -p /tmp/llama-release
           tar xzf /tmp/llama-release.tar.gz -C /tmp/llama-release --strip-components=1
 
-      - name: Montar pacote embarcado (llama-server + libs compartilhadas)
+      - name: Assemble the bundled package (llama-server + shared libs)
         shell: bash
         run: |
           set -euo pipefail
@@ -79,25 +77,25 @@ jobs:
           mkdir -p "$bundle"
           cp /tmp/llama-release/llama-server "$bundle"/
           cp /tmp/llama-release/LICENSE "$bundle"/LICENSE-llama-cpp
-          # Nunca escolher um subconjunto "mínimo" de libs a dedo — o grafo
-          # de dependência do ggml muda entre releases (novos backends de
-          # CPU, Metal, RPC...); empacotar tudo que veio junto no release
-          # oficial é a única forma robusta de garantir que o dynamic
-          # linker encontra tudo (verificado manualmente: llama-server
-          # falha ao carregar sem as libs irmãs — ver sprint-status.md).
+          # Never hand-pick a "minimal" subset of libs — ggml's dependency
+          # graph changes between releases (new CPU/Metal/RPC backends);
+          # bundling everything that shipped in the official release is the
+          # only robust way to guarantee the dynamic linker finds
+          # everything (verified manually: llama-server fails to load
+          # without its sibling libs).
           cp /tmp/llama-release/*.dylib "$bundle"/ 2>/dev/null || true
           cp /tmp/llama-release/*.so* "$bundle"/ 2>/dev/null || true
           tar czf /tmp/llama-server-bundle.tar.gz -C "$bundle" .
           ls -lh /tmp/llama-server-bundle.tar.gz
 
-      - name: cargo build --release (com llama-server embutido)
+      - name: cargo build --release (with llama-server bundled in)
         env:
           KERN_LLAMA_SERVER_ARCHIVE: /tmp/llama-server-bundle.tar.gz
         run: |
           rustup target add ${{ matrix.target }}
           cargo build --release -p kern-cli --features bundled-llama-server --target ${{ matrix.target }}
 
-      - name: Empacotar artefato
+      - name: Package the artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -115,12 +113,13 @@ jobs:
           path: kern-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  # Só roda em push de tag (`v*`) — workflow_dispatch existe pra testar o
-  # build matrix isoladamente, sem publicar release. Junta os artefatos dos
-  # 3 jobs da matrix e anexa num GitHub Release, no formato que o README
-  # espera (`releases/latest/download/kern-<target>.tar.gz`).
+  # Only runs on a tag push (`v*`) — workflow_dispatch exists to test the
+  # build matrix in isolation, without publishing a release. Collects the
+  # artifacts from the 3 matrix jobs and attaches them to a GitHub Release,
+  # in the shape the README expects
+  # (`releases/latest/download/kern-<target>.tar.gz`).
   publish:
-    name: publicar GitHub Release
+    name: publish GitHub Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04

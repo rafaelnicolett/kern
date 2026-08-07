@@ -11,10 +11,10 @@
 .DS_Store
 Thumbs.db
 
-# Runtime state kern gera por projeto (nunca versionar dados de usuário)
+# Per-project runtime state kern generates (never version user data)
 .kern/
 
-# Cache local de modelos (nunca versionar pesos)
+# Local model cache (never version model weights)
 .cache/
 
 # Env

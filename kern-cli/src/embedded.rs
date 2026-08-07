@@ -1,14 +1,14 @@
-//! Backend embarcado — extrai `llama-server` (+ libs compartilhadas) do
-//! próprio binário do kern pro cache local, no primeiro uso. Só existe de
-//! verdade quando a build foi feita com `--features bundled-llama-server`
-//! (builds de release da CI, ver `.github/workflows/release.yml`); builds de
-//! desenvolvimento não embutem nada e dependem só do probe de Ollama (ver
-//! `cmd_serve` em `main.rs`).
+//! Embedded backend — extracts `llama-server` (+ shared libs) from kern's
+//! own binary into the local cache, on first use. Only actually exists
+//! when the build was made with `--features bundled-llama-server`
+//! (CI release builds, see `.github/workflows/release.yml`); development
+//! builds don't embed anything and depend only on the Ollama probe (see
+//! `cmd_serve` in `main.rs`).
 //!
-//! O modelo `.gguf` em si **não** é embutido (pesos de modelo são grandes
-//! demais pro binário) — é resolvido separadamente a partir do cache local
-//! (`~/.cache/kern/models/`). Download automático via Hugging Face Hub
-//! ainda não está implementado (ver sprint-status.md, Sprint S5).
+//! The `.gguf` model itself is **not** embedded (model weights are too
+//! large for the binary) — it's resolved separately from the local cache
+//! (`~/.cache/kern/models/`). Automatic download via Hugging Face Hub is
+//! not yet implemented (see sprint-status.md).
 
 use std::path::PathBuf;
 
@@ -27,8 +27,8 @@ fn binary_name() -> &'static str {
 
 #[cfg(feature = "bundled-llama-server")]
 fn default_cache_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("não foi possível resolver o diretório home"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not resolve the home directory"))?;
     Ok(home
         .join(".cache")
         .join("kern")
@@ -36,9 +36,9 @@ fn default_cache_dir() -> anyhow::Result<PathBuf> {
         .join("llama-server"))
 }
 
-/// Extrai o pacote embarcado pra `cache_dir` se ainda não estiver lá —
-/// idempotente, chamadas repetidas não reextraem. Retorna o path do
-/// executável `llama-server` já com permissão de execução (unix).
+/// Extracts the embedded bundle to `cache_dir` if it's not there yet —
+/// idempotent, repeated calls don't re-extract. Returns the path to the
+/// `llama-server` executable, already made executable (unix).
 #[cfg(feature = "bundled-llama-server")]
 fn ensure_extracted_at(cache_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
     let binary_path = cache_dir.join(binary_name());
@@ -60,8 +60,8 @@ fn ensure_extracted_at(cache_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
 
     if !binary_path.exists() {
         anyhow::bail!(
-            "extração do pacote embarcado não produziu {} — pacote corrompido ou \
-             layout inesperado",
+            "extracting the embedded bundle did not produce {} — corrupted bundle or \
+             unexpected layout",
             binary_path.display()
         );
     }
@@ -76,15 +76,15 @@ pub fn ensure_llama_server_binary() -> anyhow::Result<PathBuf> {
 #[cfg(not(feature = "bundled-llama-server"))]
 pub fn ensure_llama_server_binary() -> anyhow::Result<PathBuf> {
     anyhow::bail!(
-        "esta build não embute o llama-server (feature bundled-llama-server desativada \
-         — só builds de release da CI a ativam)"
+        "this build does not embed llama-server (bundled-llama-server feature disabled \
+         — only CI release builds enable it)"
     )
 }
 
-/// Primeiro `.gguf` encontrado em `~/.cache/kern/models/`, ordem
-/// alfabética — v0 não escolhe um modelo "oficial" default nem baixa nada
-/// automaticamente (ver módulo doc). Falha explícita se o diretório não
-/// existir ou estiver vazio; quem chama decide a mensagem de erro final.
+/// First `.gguf` found in `~/.cache/kern/models/`, alphabetical order —
+/// v0 doesn't pick an "official" default model nor download anything
+/// automatically (see module doc). Fails explicitly if the directory
+/// doesn't exist or is empty; the caller decides the final error message.
 pub fn find_cached_model() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let models_dir = home.join(".cache").join("kern").join("models");
@@ -102,22 +102,21 @@ pub fn find_cached_model() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Extrai o pacote embarcado de verdade (o binário de teste só existe
-    /// quando compilado com `--features bundled-llama-server` e uma release
-    /// CI real forneceu `KERN_LLAMA_SERVER_ARCHIVE` — não roda no `cargo
-    /// test --workspace` padrão de desenvolvimento).
+    /// Actually extracts the embedded bundle (the test binary only exists
+    /// when compiled with `--features bundled-llama-server` and a real CI
+    /// release provided `KERN_LLAMA_SERVER_ARCHIVE` — does not run in the
+    /// default development `cargo test --workspace`).
     #[test]
-    fn ensure_extracted_at_produz_binario_executavel_e_e_idempotente() {
+    fn ensure_extracted_at_produces_executable_binary_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let cache_dir = tmp.path().join("llama-server");
 
-        let first = ensure_extracted_at(&cache_dir).expect("primeira extração deveria funcionar");
+        let first = ensure_extracted_at(&cache_dir).expect("first extraction should work");
         assert!(first.exists());
 
         let modified_before = std::fs::metadata(&first).unwrap().modified().unwrap();
-        let second =
-            ensure_extracted_at(&cache_dir).expect("segunda chamada deveria ser idempotente");
+        let second = ensure_extracted_at(&cache_dir).expect("second call should be idempotent");
         let modified_after = std::fs::metadata(&second).unwrap().modified().unwrap();
-        assert_eq!(modified_before, modified_after, "não deveria reextrair");
+        assert_eq!(modified_before, modified_after, "should not re-extract");
     }
 }
