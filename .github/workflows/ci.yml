@@ -53,6 +53,13 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check publica o resultado como GitHub Check Run — sem
+    # isso o job roda o audit (que passa) e falha só na publicação, com
+    # "Resource not accessible by integration" (achado real: permissão
+    # padrão do GITHUB_TOKEN em repo novo não inclui checks:write).
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
