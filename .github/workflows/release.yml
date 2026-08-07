@@ -39,6 +39,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # lance-encoding (dependência transitiva via lancedb) compila .proto
+      # com prost-build em build.rs — exige o binário `protoc` no PATH, os
+      # runners do GitHub não vêm com ele por padrão (mesmo achado do
+      # ci.yml: build local funcionava só porque já tinha protoc via
+      # Homebrew nesta máquina).
+      - name: Instalar protoc (protobuf-compiler)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          else
+            brew install protobuf
+          fi
+
       - name: Instalar toolchain pinado
         run: rustup show
 
