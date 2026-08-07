@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Build de referência do llama.cpp usada pra montar o pacote embarcado —
+  # pinada explicitamente (nunca "latest" solto no momento do build, ver
+  # Skill lang-rust / rust-toolchain.toml pro mesmo racional aplicado ao
+  # Rust). Atualizar aqui é uma decisão deliberada, testada manualmente
+  # antes do bump.
+  LLAMA_CPP_RELEASE_TAG: b10298
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux arm64 e Windows ficam de fora deste v0 — llama-server
+          # nesses alvos precisa de verificação própria (empacotamento de
+          # DLL no Windows, runner arm64 hospedado no Linux) que não foi
+          # feita ainda. Ver sprint-status.md, Sprint S5: escopo parcial
+          # deliberado, não descope.
+          - os: macos-14 # Apple Silicon nativo
+            target: aarch64-apple-darwin
+            llama_asset_suffix: macos-arm64
+          - os: macos-13 # Intel nativo
+            target: x86_64-apple-darwin
+            llama_asset_suffix: macos-x64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            llama_asset_suffix: ubuntu-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar toolchain pinado
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "kern-release-${{ matrix.target }}"
+
+      - name: Baixar e extrair o release do llama.cpp para esta plataforma
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="llama-${LLAMA_CPP_RELEASE_TAG}-bin-${{ matrix.llama_asset_suffix }}"
+          url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE_TAG}/${asset}"
+          echo "baixando ${url}"
+          curl -sL --fail -o /tmp/llama-release.tar.gz "${url}"
+          mkdir -p /tmp/llama-release
+          tar xzf /tmp/llama-release.tar.gz -C /tmp/llama-release --strip-components=1
+
+      - name: Montar pacote embarcado (llama-server + libs compartilhadas)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle=/tmp/llama-bundle
+          mkdir -p "$bundle"
+          cp /tmp/llama-release/llama-server "$bundle"/
+          cp /tmp/llama-release/LICENSE "$bundle"/LICENSE-llama-cpp
+          # Nunca escolher um subconjunto "mínimo" de libs a dedo — o grafo
+          # de dependência do ggml muda entre releases (novos backends de
+          # CPU, Metal, RPC...); empacotar tudo que veio junto no release
+          # oficial é a única forma robusta de garantir que o dynamic
+          # linker encontra tudo (verificado manualmente: llama-server
+          # falha ao carregar sem as libs irmãs — ver sprint-status.md).
+          cp /tmp/llama-release/*.dylib "$bundle"/ 2>/dev/null || true
+          cp /tmp/llama-release/*.so* "$bundle"/ 2>/dev/null || true
+          tar czf /tmp/llama-server-bundle.tar.gz -C "$bundle" .
+          ls -lh /tmp/llama-server-bundle.tar.gz
+
+      - name: cargo build --release (com llama-server embutido)
+        env:
+          KERN_LLAMA_SERVER_ARCHIVE: /tmp/llama-server-bundle.tar.gz
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release -p kern-cli --features bundled-llama-server --target ${{ matrix.target }}
+
+      - name: Empacotar artefato
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=kern-${{ matrix.target }}
+          mkdir -p "$out"
+          bin="target/${{ matrix.target }}/release/kern"
+          [ -f "$bin" ] || bin="target/${{ matrix.target }}/release/kern.exe"
+          cp "$bin" "$out"/
+          cp README.md LICENSE-MIT LICENSE-APACHE "$out"/
+          tar czf "$out.tar.gz" "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kern-${{ matrix.target }}
+          path: kern-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  # Só roda em push de tag (`v*`) — workflow_dispatch existe pra testar o
+  # build matrix isoladamente, sem publicar release. Junta os artefatos dos
+  # 3 jobs da matrix e anexa num GitHub Release, no formato que o README
+  # espera (`releases/latest/download/kern-<target>.tar.gz`).
+  publish:
+    name: publicar GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kern-*
+          merge-multiple: true
+          path: dist
+
+      - name: softprops/action-gh-release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true

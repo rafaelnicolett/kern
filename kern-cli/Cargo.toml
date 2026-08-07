@@ -1,0 +1,38 @@
+[package]
+name = "kern-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kern"
+path = "src/main.rs"
+
+[dependencies]
+kern-mcp.workspace = true
+kern-ontology.workspace = true
+kern-ingest.workspace = true
+kern-vector.workspace = true
+kern-model.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+clap = { version = "4", features = ["derive"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-io"] }
+dirs = "5"
+tar = { version = "0.4.46", optional = true }
+flate2 = { version = "1.1.9", optional = true }
+
+[features]
+# Ativada só pela release CI (.github/workflows/release.yml) — embute
+# llama-server + libs compartilhadas via include_bytes!, ver src/embedded.rs.
+# Builds de dev/PR ficam sem ela: sem binário embarcado, só Ollama oportunista.
+bundled-llama-server = ["dep:tar", "dep:flate2"]
+
+[dev-dependencies]
+tempfile = "3"

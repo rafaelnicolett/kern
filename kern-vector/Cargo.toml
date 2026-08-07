@@ -1,0 +1,31 @@
+[package]
+name = "kern-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+# 0.4.x estava fixado por engano (versão de treinamento desatualizada) —
+# latest real é 0.33.x (jul/2026). Sem pin de versão própria para
+# arrow-array/arrow-schema: usar exatamente o que lancedb já traz.
+lancedb = "0.33"
+futures = "0.3"
+
+# Sem dependência direta de arrow-array/arrow-schema: usar os tipos
+# reexportados via `lancedb::arrow::*`, senão o resolver do Cargo traz uma
+# segunda árvore de arrow (versão mais nova) incompatível em tipo com a que
+# o lancedb usa internamente (achado real — ver sprint-status.md).
+
+[dev-dependencies]
+tempfile = "3"
+# Só para o teste de integração fim a fim (tests/pipeline.rs) — kern-vector
+# em si não depende de kern-ingest/kern-model em produção.
+kern-ingest.workspace = true
+kern-model.workspace = true

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test / clippy / fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Instala exatamente o toolchain pinado em rust-toolchain.toml — nunca
+      # `stable` solto (ver docs/adr/0003 e Skill lang-rust).
+      - name: Instalar toolchain pinado
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "kern-ci"
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+        # Testes de integração real contra Ollama (`extract`/`judge`/`embed`)
+        # pulam graciosamente (não falham) quando o daemon não está
+        # disponível — CI não precisa de Ollama instalado. Ver
+        # sprint-status.md do workspace de delivery para o racional.
+
+      - name: Validar Cargo.lock commitado
+        run: cargo update --workspace --locked
+        # Falha se Cargo.lock estiver desatualizado em relação ao Cargo.toml
+        # — garante que o lockfile commitado é o que o CI de fato usou.
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

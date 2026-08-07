@@ -1,0 +1,22 @@
+# Build artifacts
+/target/
+**/target/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime state kern gera por projeto (nunca versionar dados de usuário)
+.kern/
+
+# Cache local de modelos (nunca versionar pesos)
+.cache/
+
+# Env
+.env
+.env.local

@@ -1,0 +1,19 @@
+[package]
+name = "kern-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# LlamaCppRuntime spawna `llama-server` via tokio::process::Command (feature
+# "process" do tokio, já habilitada no workspace) e fala HTTP local com o
+# mesmo cliente reqwest — sem dependência de crate extra.

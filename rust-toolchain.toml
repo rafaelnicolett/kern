@@ -1,0 +1,16 @@
+[toolchain]
+# MSRV — pinado explicitamente, nunca "always latest" via canal `stable`.
+#
+# Histórico de bump (mantenha ao evoluir este arquivo):
+# - 1.75.0 (S1): primeira stable com native async fn in traits.
+# - 1.85.0 (S2-BKD-03): lancedb/arrow exigiam a feature `edition2024`.
+# - 1.97.1 (S2-BKD-03): a árvore transitiva de lancedb (icu_*, time) sobe o
+#   requisito de novo, mais de uma vez, até a stable corrente no momento
+#   (2026-07-14). Empiricamente, `lancedb` como dependência não deixa espaço
+#   pra MSRV conservador clássico — pinamos a stable real resolvida nesta
+#   sprint, não o canal `stable` (que rolaria sozinho a cada `rustup update`).
+#
+# Reavalie este pin se uma versão futura de `lancedb`/`arrow` afrouxar as
+# próprias exigências de MSRV.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
