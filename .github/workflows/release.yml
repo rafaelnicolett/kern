@@ -28,7 +28,7 @@ jobs:
           - os: macos-14 # native Apple Silicon
             target: aarch64-apple-darwin
             llama_asset_suffix: macos-arm64
-          - os: macos-13 # native Intel
+          - os: macos-15-intel # native Intel — macos-13 was retired by GitHub in Dec 2025
             target: x86_64-apple-darwin
             llama_asset_suffix: macos-x64
           - os: ubuntu-24.04
