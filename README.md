@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/mascot.jpg" alt="kern mascot" width="360">
+  <img src="docs/banner.png" alt="kern" width="640">
 </p>
 
-# kern
-
-[![CI](https://github.com/rafaelnicolett/kern/actions/workflows/ci.yml/badge.svg)](https://github.com/rafaelnicolett/kern/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.97.1%2B-orange.svg)](rust-toolchain.toml)
+<p align="center">
+<a href="https://github.com/rafaelnicolett/kern/actions/workflows/ci.yml"><img src="https://github.com/rafaelnicolett/kern/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License"></a>
+<a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/rust-1.97.1%2B-orange.svg" alt="Rust"></a>
+</p>
 
 **kern** is a local-first RAG engine with an incrementally-built ontology,
 exposed to any AI agent over MCP.
