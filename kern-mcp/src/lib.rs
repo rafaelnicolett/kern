@@ -507,8 +507,9 @@ mod tests {
             Arc::new(SqliteTypeRepository::open(&db_path).unwrap());
         let instances: Arc<dyn InstanceRepository> =
             Arc::new(SqliteInstanceRepository::open(&db_path).unwrap());
-        let vector_store: Arc<dyn VectorStore> =
-            Arc::new(LanceVectorStore::open(dir).await.unwrap());
+        let mut lance_store = LanceVectorStore::open(dir).await.unwrap();
+        lance_store.ensure_table(384).await.unwrap();
+        let vector_store: Arc<dyn VectorStore> = Arc::new(lance_store);
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(OllamaClient::new("all-minilm"));
         (
             KernServer::new(types, instances, vector_store, embedder.clone()),

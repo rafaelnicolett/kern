@@ -20,11 +20,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Embedding vector dimension. Placeholder — depends on the default model
-/// chosen in kern-model (bge-small = 384; nomic-embed = 768). TODO: make this
-/// configurable alongside the model choice, instead of a fixed constant.
-pub const EMBEDDING_DIM: i32 = 384;
-
 const TABLE_NAME: &str = "chunks";
 
 #[derive(Debug, Error)]
@@ -37,6 +32,15 @@ pub enum VectorStoreError {
     Lance(#[from] lancedb::Error),
     #[error("Arrow error: {0}")]
     Arrow(#[from] ArrowError),
+    #[error(
+        "AGENT_SURFACE.EMBEDDING_DIMENSION_MISMATCH: this project was indexed with a \
+         {actual}-dim model, but the configured provider now reports {expected} dims — \
+         switching embedding models on an existing project requires re-indexing (delete \
+         .kern/vectors and reconfigure); kern will not silently truncate or rebuild"
+    )]
+    DimensionMismatch { expected: i32, actual: i32 },
+    #[error("vector table not initialized — call ensure_table() before using the store")]
+    TableNotReady,
 }
 
 /// Persisted chunk record — mirrors the Arrow schema in `schema()` below.
@@ -78,17 +82,14 @@ pub trait VectorStore: Send + Sync {
     async fn count(&self) -> Result<usize, VectorStoreError>;
 }
 
-fn schema() -> Arc<Schema> {
+fn schema(dim: i32) -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("file_path", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
         Field::new(
             "embedding",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                EMBEDDING_DIM,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
             true,
         ),
         Field::new("content_hash", DataType::Utf8, false),
@@ -96,14 +97,20 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+/// Dimension comes from the record's own real embedding length — ground
+/// truth from the data being written, not a separately-tracked constant.
+/// If this doesn't match the table's actual pinned schema, LanceDB itself
+/// surfaces a real schema-mismatch error on `merge.execute` below; kern
+/// doesn't need to duplicate that check on every write.
 fn record_to_batch(record: &ChunkRecord) -> Result<RecordBatch, VectorStoreError> {
-    let schema = schema();
+    let dim = record.embedding.len() as i32;
+    let schema = schema(dim);
 
     let embedding_values = Float32Array::from(record.embedding.clone());
     let embedding_field = Arc::new(Field::new("item", DataType::Float32, true));
     let embedding = lancedb::arrow::arrow_array::FixedSizeListArray::try_new(
         embedding_field,
-        EMBEDDING_DIM,
+        dim,
         Arc::new(embedding_values),
         None,
     )?;
@@ -123,13 +130,23 @@ fn record_to_batch(record: &ChunkRecord) -> Result<RecordBatch, VectorStoreError
 
 /// Real adapter over the native LanceDB crate (no FFI, no external server).
 /// One directory per project (`<project>/.kern/vectors/`).
+///
+/// `open` only connects — it does **not** create the table. Table creation
+/// pins the embedding dimension into the Arrow schema for the table's
+/// lifetime (LanceDB can't change a `FixedSizeList` width after data
+/// exists), so it's deferred to `ensure_table`, called explicitly once the
+/// real dimension is known (from a resolved provider's
+/// `EmbeddingCapabilities`, see kern-model) — never implicitly at
+/// project-creation time before any model has been chosen.
 pub struct LanceVectorStore {
-    table: lancedb::Table,
+    db: lancedb::Connection,
+    table: Option<lancedb::Table>,
 }
 
 impl LanceVectorStore {
-    /// Opens (or creates, if it doesn't exist yet) the vector index in the
-    /// project's folder.
+    /// Connects to the project's vector directory. Does not create or
+    /// require a table to already exist — call `ensure_table` before using
+    /// any `VectorStore` method.
     pub async fn open(root: &Path) -> Result<Self, VectorStoreError> {
         let db = lancedb::connect(&root.to_string_lossy())
             .execute()
@@ -141,16 +158,55 @@ impl LanceVectorStore {
 
         let existing = db.table_names().execute().await?;
         let table = if existing.iter().any(|n| n == TABLE_NAME) {
-            db.open_table(TABLE_NAME).execute().await?
+            Some(db.open_table(TABLE_NAME).execute().await?)
         } else {
-            let schema = schema();
-            let empty_batches: Vec<Result<RecordBatch, ArrowError>> = vec![];
-            let reader = RecordBatchIterator::new(empty_batches, schema.clone());
-            let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
-            db.create_table(TABLE_NAME, reader).execute().await?
+            None
         };
 
-        Ok(Self { table })
+        Ok(Self { db, table })
+    }
+
+    /// The real embedding dimension already pinned into this project's
+    /// table, if one exists yet — read from the table's actual Arrow
+    /// schema, not from any separately-tracked config, so it stays correct
+    /// even for a project indexed before per-project config existed.
+    pub async fn existing_dimension(&self) -> Result<Option<i32>, VectorStoreError> {
+        let Some(table) = &self.table else {
+            return Ok(None);
+        };
+        let schema = table.schema().await?;
+        let field = schema.field_with_name("embedding")?;
+        Ok(match field.data_type() {
+            DataType::FixedSizeList(_, dim) => Some(*dim),
+            _ => None,
+        })
+    }
+
+    /// Idempotent: no-op if a table already exists with a matching `dim`;
+    /// a clear `DimensionMismatch` error if it exists with a *different*
+    /// one (never silently truncates/rebuilds); creates it if absent.
+    pub async fn ensure_table(&mut self, dim: i32) -> Result<(), VectorStoreError> {
+        if let Some(existing) = self.existing_dimension().await? {
+            if existing != dim {
+                return Err(VectorStoreError::DimensionMismatch {
+                    expected: dim,
+                    actual: existing,
+                });
+            }
+            return Ok(());
+        }
+
+        let schema = schema(dim);
+        let empty_batches: Vec<Result<RecordBatch, ArrowError>> = vec![];
+        let reader = RecordBatchIterator::new(empty_batches, schema.clone());
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
+        let table = self.db.create_table(TABLE_NAME, reader).execute().await?;
+        self.table = Some(table);
+        Ok(())
+    }
+
+    fn table(&self) -> Result<&lancedb::Table, VectorStoreError> {
+        self.table.as_ref().ok_or(VectorStoreError::TableNotReady)
     }
 }
 
@@ -162,7 +218,7 @@ impl VectorStore for LanceVectorStore {
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(reader);
 
-        let mut merge = self.table.merge_insert(&["id"]);
+        let mut merge = self.table()?.merge_insert(&["id"]);
         merge.when_matched_update_all(None);
         merge.when_not_matched_insert_all();
         merge.execute(reader).await?;
@@ -171,7 +227,7 @@ impl VectorStore for LanceVectorStore {
 
     async fn delete_by_file(&self, file_path: &str) -> Result<(), VectorStoreError> {
         let escaped = file_path.replace('\'', "''");
-        self.table
+        self.table()?
             .delete(&format!("file_path = '{escaped}'"))
             .await?;
         Ok(())
@@ -191,7 +247,7 @@ impl VectorStore for LanceVectorStore {
         let candidate_pool = (top_k * 4).max(20);
 
         let results: Vec<RecordBatch> = self
-            .table
+            .table()?
             .query()
             .nearest_to(query_embedding)?
             .limit(candidate_pool)
@@ -254,7 +310,7 @@ impl VectorStore for LanceVectorStore {
     }
 
     async fn count(&self) -> Result<usize, VectorStoreError> {
-        Ok(self.table.count_rows(None).await?)
+        Ok(self.table()?.count_rows(None).await?)
     }
 }
 
@@ -327,16 +383,144 @@ fn extract_keywords(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    const TEST_DIM: i32 = 384;
+
     fn fake_embedding(seed: f32) -> Vec<f32> {
-        (0..EMBEDDING_DIM)
-            .map(|i| seed + i as f32 * 0.001)
-            .collect()
+        (0..TEST_DIM).map(|i| seed + i as f32 * 0.001).collect()
+    }
+
+    async fn open_and_ensure(dir: &Path, dim: i32) -> LanceVectorStore {
+        let mut store = LanceVectorStore::open(dir).await.unwrap();
+        store.ensure_table(dim).await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn ensure_table_creates_the_table_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LanceVectorStore::open(dir.path()).await.unwrap();
+        assert_eq!(store.existing_dimension().await.unwrap(), None);
+
+        store.ensure_table(TEST_DIM).await.unwrap();
+        assert_eq!(store.existing_dimension().await.unwrap(), Some(TEST_DIM));
+    }
+
+    #[tokio::test]
+    async fn ensure_table_is_idempotent_when_dim_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LanceVectorStore::open(dir.path()).await.unwrap();
+        store.ensure_table(TEST_DIM).await.unwrap();
+
+        // A second call with the same dim must not error and must not
+        // touch the already-indexed data.
+        store
+            .upsert(ChunkRecord {
+                id: Uuid::new_v4(),
+                file_path: "docs/a.md".to_string(),
+                content: "content".to_string(),
+                embedding: fake_embedding(1.0),
+                content_hash: "hash-1".to_string(),
+                updated_at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        store.ensure_table(TEST_DIM).await.unwrap();
+        assert_eq!(
+            store.count().await.unwrap(),
+            1,
+            "re-ensuring must not wipe existing data"
+        );
+    }
+
+    /// The core correctness guarantee of dimension pinning: an attempt to
+    /// re-point an already-indexed project at a differently-dimensioned
+    /// model is a clear error, never a silent truncation/rebuild — and the
+    /// existing table is left completely untouched.
+    #[tokio::test]
+    async fn ensure_table_rejects_a_different_dim_and_leaves_the_table_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LanceVectorStore::open(dir.path()).await.unwrap();
+        store.ensure_table(TEST_DIM).await.unwrap();
+        store
+            .upsert(ChunkRecord {
+                id: Uuid::new_v4(),
+                file_path: "docs/a.md".to_string(),
+                content: "content".to_string(),
+                embedding: fake_embedding(1.0),
+                content_hash: "hash-1".to_string(),
+                updated_at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let err = store.ensure_table(768).await.unwrap_err();
+        assert!(matches!(
+            err,
+            VectorStoreError::DimensionMismatch {
+                expected: 768,
+                actual: 384
+            }
+        ));
+
+        // Untouched: still 384-dim, still has the one record.
+        assert_eq!(store.existing_dimension().await.unwrap(), Some(TEST_DIM));
+        assert_eq!(store.count().await.unwrap(), 1);
+    }
+
+    /// Simulates a project indexed *before* this dimension-pinning
+    /// mechanism existed: a real 384-dim table with data in it, but
+    /// nothing has called `ensure_table` yet on this `LanceVectorStore`
+    /// instance (mirrors a fresh process opening an old project with no
+    /// persisted config to consult). Resolving to the SAME real dimension
+    /// must succeed via the table's own schema, not fail just because no
+    /// config file exists.
+    #[tokio::test]
+    async fn ensure_table_succeeds_against_a_pre_existing_table_with_no_prior_config() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First process: creates and populates the table (today's world,
+        // no dimension-pinning awareness).
+        {
+            let mut store = LanceVectorStore::open(dir.path()).await.unwrap();
+            store.ensure_table(TEST_DIM).await.unwrap();
+            store
+                .upsert(ChunkRecord {
+                    id: Uuid::new_v4(),
+                    file_path: "docs/legacy.md".to_string(),
+                    content: "pre-existing content".to_string(),
+                    embedding: fake_embedding(1.0),
+                    content_hash: "hash-legacy".to_string(),
+                    updated_at: "2026-08-06T00:00:00Z".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Second process (post-initiative kern): opens the same directory
+        // fresh, resolves a provider that happens to report the same real
+        // dimension, and must succeed + see the pre-existing data.
+        let mut store = LanceVectorStore::open(dir.path()).await.unwrap();
+        store.ensure_table(TEST_DIM).await.unwrap();
+        assert_eq!(
+            store.count().await.unwrap(),
+            1,
+            "pre-existing data must survive"
+        );
+
+        let results = store
+            .search_hybrid(&fake_embedding(1.0), "", 5)
+            .await
+            .unwrap();
+        assert!(results
+            .iter()
+            .any(|r| r.chunk.file_path == "docs/legacy.md"));
     }
 
     #[tokio::test]
     async fn upsert_and_similarity_search_finds_the_chunk() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceVectorStore::open(dir.path()).await.unwrap();
+        let store = open_and_ensure(dir.path(), TEST_DIM).await;
 
         let record = ChunkRecord {
             id: Uuid::new_v4(),
@@ -359,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn count_reflects_number_of_indexed_chunks() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceVectorStore::open(dir.path()).await.unwrap();
+        let store = open_and_ensure(dir.path(), TEST_DIM).await;
         assert_eq!(store.count().await.unwrap(), 0);
 
         for i in 0..3 {
@@ -382,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn delete_by_file_removes_chunks_for_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceVectorStore::open(dir.path()).await.unwrap();
+        let store = open_and_ensure(dir.path(), TEST_DIM).await;
 
         let record = ChunkRecord {
             id: Uuid::new_v4(),
@@ -408,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_with_same_id_updates_instead_of_duplicating() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceVectorStore::open(dir.path()).await.unwrap();
+        let store = open_and_ensure(dir.path(), TEST_DIM).await;
         let id = Uuid::new_v4();
 
         store
@@ -455,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn keyword_boost_displaces_vectorially_closer_chunk_with_no_shared_term() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceVectorStore::open(dir.path()).await.unwrap();
+        let store = open_and_ensure(dir.path(), TEST_DIM).await;
 
         // A: identical to the query in embedding — always ranks first.
         store

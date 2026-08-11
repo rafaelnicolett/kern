@@ -34,10 +34,18 @@ The watcher observes the folder and triggers reindexing only on a real hash chan
     assert_eq!(chunks.len(), 2, "expected 2 chunks (2 headings)");
 
     let dir = tempfile::tempdir().unwrap();
-    let store = match LanceVectorStore::open(dir.path()).await {
+    let mut store = match LanceVectorStore::open(dir.path()).await {
         Ok(s) => s,
         Err(e) => panic!("failed to open LanceVectorStore: {e}"),
     };
+    let caps = provider
+        .capabilities()
+        .await
+        .expect("capabilities should succeed against a real running Ollama");
+    store
+        .ensure_table(caps.embedding_dim as i32)
+        .await
+        .expect("ensure_table should succeed against a fresh directory");
 
     for chunk in &chunks {
         let embedding = match provider.embed(&chunk.content).await {

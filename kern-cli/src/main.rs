@@ -114,7 +114,11 @@ async fn cmd_project_create(name: String, path: PathBuf) -> anyhow::Result<()> {
     types.seed_canonical_vocabulary().await?;
     let _instances = SqliteInstanceRepository::open(&db_path)?;
     let _frontmatter = SqliteFrontmatterProfileRepository::open(&db_path)?;
-    let _vectors = LanceVectorStore::open(&path.join(".kern").join("vectors")).await?;
+    let mut vectors = LanceVectorStore::open(&path.join(".kern").join("vectors")).await?;
+    // 384 is a temporary bridge value — the plug-and-play config work (kern
+    // config / the setup wizard) will pin this from the actually configured
+    // provider's real EmbeddingCapabilities instead of a fixed literal.
+    vectors.ensure_table(384).await?;
 
     registry.insert(name.clone(), path.clone());
     save_registry(&registry)?;
@@ -324,8 +328,10 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
         Arc::new(SqliteInstanceRepository::open(&db_path)?);
     let frontmatter_profiles: Arc<dyn kern_ontology::FrontmatterProfileRepository> =
         Arc::new(SqliteFrontmatterProfileRepository::open(&db_path)?);
-    let vector_store: Arc<dyn VectorStore> =
-        Arc::new(LanceVectorStore::open(&root.join(".kern").join("vectors")).await?);
+    let mut lance_store = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
+    // 384 is a temporary bridge value — see cmd_project_create.
+    lance_store.ensure_table(384).await?;
+    let vector_store: Arc<dyn VectorStore> = Arc::new(lance_store);
 
     let ontology_engine = extraction.map(|extraction| {
         OntologyEngine::new(
@@ -390,7 +396,9 @@ async fn cmd_status(project: Option<String>) -> anyhow::Result<()> {
     let root = resolve_project(&name)?;
     let db_path = root.join(".kern").join("registry.db");
     let types = SqliteTypeRepository::open(&db_path)?;
-    let vector_store = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
+    let mut vector_store = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
+    // 384 is a temporary bridge value — see cmd_project_create.
+    vector_store.ensure_table(384).await?;
 
     let entity_types = types.list_entity_types().await?;
     let relation_types = types.list_relation_types().await?;
