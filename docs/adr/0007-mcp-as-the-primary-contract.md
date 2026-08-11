@@ -18,11 +18,10 @@ running on the user's machine, with no network involved.
 - `api/openapi.yaml` stays in the repository as an **honest placeholder**
   (no paths), pointing to the real contract — it exists only so tooling that
   expects the file to be present doesn't break, never as a source of truth.
-- Sequence and container diagrams (kept in the private delivery workspace,
-  not published in this repo) cover the two flows that actually define the
-  product — ingestion through an ontology decision, and `query_ontological`
-  routing with its vector-search fallback — not authentication, because
-  there is none (see ADR-0006).
+- No sequence/container diagrams are published in this repo yet — the two
+  flows that actually define the product are ingestion through an ontology
+  decision, and `query_ontological` routing with its vector-search
+  fallback, not authentication, because there is none (see ADR-0006).
 
 > **Implementation note (added after the fact)**: the original decision also
 > specified a structured MCP error envelope (`isError: true` +

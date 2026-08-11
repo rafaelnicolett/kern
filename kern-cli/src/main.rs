@@ -1,8 +1,7 @@
 //! kern-cli — the final binary: `project create`, `serve`, `status`.
 //!
 //! Single runtime: the same binary watches, converts, extracts, indexes, and
-//! serves. See the KernProcess state machine below (design rationale kept in
-//! the maintainer's private delivery workspace, not published in this repo).
+//! serves. See the `ProcessState` state machine below.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,9 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 mod embedded;
 
-/// KernProcess states — strictly sequential transitions, no going back
-/// (design rationale kept in the maintainer's private delivery workspace,
-/// not published in this repo).
+/// Process states — strictly sequential transitions, no going back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessState {
     Starting,
@@ -103,9 +100,7 @@ fn save_registry(registry: &HashMap<String, PathBuf>) -> anyhow::Result<()> {
 
 async fn cmd_project_create(name: String, path: PathBuf) -> anyhow::Result<()> {
     let mut registry = load_registry()?;
-    // Name must be unique within the local machine scope (design rationale
-    // kept in the maintainer's private delivery workspace, not published in
-    // this repo).
+    // Name must be unique within the local machine scope.
     if registry.contains_key(&name) {
         anyhow::bail!("AGENT_SURFACE.PROJECT_ALREADY_EXISTS: '{name}' already exists");
     }
@@ -137,9 +132,7 @@ fn resolve_project(name: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// CatchUpScan — reuses the same hash-diff as the watcher to recover from
-/// lag (design rationale kept in the maintainer's private delivery
-/// workspace, not published in this repo). Chunk+embed+index always
-/// happens. Ontology enrichment only happens when `ontology_engine` is
+/// lag. Chunk+embed+index always happens. Ontology enrichment only happens when `ontology_engine` is
 /// `Some` — it is `None` when Ollama is not available (the embedded
 /// backend only covers embedding, see `spawn_embedded_embedder`). An
 /// isolated enrichment failure on one file/chunk never aborts the vector

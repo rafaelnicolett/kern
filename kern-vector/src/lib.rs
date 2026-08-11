@@ -1,8 +1,7 @@
 //! kern-vector — a thin wrapper around embedded LanceDB.
 //!
 //! One record per chunk: {id, file_path, content, embedding, content_hash,
-//! updated_at} (design rationale kept in the maintainer's private delivery
-//! workspace, not published in this repo). No external server, no FFI.
+//! updated_at}. No external server, no FFI.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -40,8 +39,7 @@ pub enum VectorStoreError {
     Arrow(#[from] ArrowError),
 }
 
-/// Persisted chunk record — mirrors the schema (design rationale kept in the
-/// maintainer's private delivery workspace, not published in this repo).
+/// Persisted chunk record — mirrors the Arrow schema in `schema()` below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRecord {
     pub id: Uuid,

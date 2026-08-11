@@ -30,8 +30,8 @@ pub enum IngestError {
     },
 }
 
-/// Indexed unit — design rationale documented in the maintainer's private
-/// delivery workspace, not published in this repo.
+/// Indexed unit — the atomic piece of a file that gets embedded and
+/// searched independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub id: Uuid,
@@ -70,9 +70,9 @@ pub fn is_real_change(
 }
 
 /// Port: markdown-aware chunking — never cuts a header, code block, or
-/// table in half. Pure/synchronous: it's CPU-bound, the caller decides
-/// whether to run it in `spawn_blocking` (per this project's Rust
-/// conventions on not blocking the runtime).
+/// table in half. Pure/synchronous: it's CPU-bound, so the caller decides
+/// whether to run it in `spawn_blocking` rather than blocking the async
+/// runtime directly.
 pub trait MarkdownChunker: Send + Sync {
     fn chunk(&self, file_path: &Path, content: &str) -> Vec<Chunk>;
 }
@@ -128,7 +128,7 @@ pub struct FileChangedEvent {
 }
 
 /// Watcher for the observed folder — event-driven via `notify`, never
-/// polling in a loop (per this project's Rust conventions, section 2.4).
+/// polling in a loop.
 pub struct Watcher {
     pub root: PathBuf,
 }

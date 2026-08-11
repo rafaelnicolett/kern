@@ -1,7 +1,6 @@
 //! kern-ontology — type registry, relation vocabulary, incremental diff
-//! engine. The core subdomain of the project (design rationale kept in the
-//! maintainer's private delivery workspace, not published in this repo) —
-//! this is what the fallback rate of `judge()` measures.
+//! engine. The core subdomain of the project — this is what the fallback
+//! rate of `judge()` measures.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

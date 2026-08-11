@@ -60,9 +60,8 @@ pub enum JudgeDecision {
     Reject,
 }
 
-/// Port consumed by kern-ontology — only called in the ambiguous zone
-/// (design rationale kept in the maintainer's private delivery workspace,
-/// not published in this repo). Loaded lazily, unloaded after idling.
+/// Port consumed by kern-ontology — only called in the ambiguous zone.
+/// Loaded lazily, unloaded after idling.
 #[async_trait]
 pub trait ExtractionProvider: Send + Sync {
     async fn extract(
@@ -92,8 +91,7 @@ pub trait ExtractionProvider: Send + Sync {
 /// subprocess and talks to it over HTTP (`/v1/embeddings`, OpenAI-compatible).
 /// `ExtractionProvider` is not implemented here: extraction/judge remain
 /// restricted to the opportunistic adapter (`OllamaClient`) until an embedded
-/// generative model comes into scope (design rationale kept in the
-/// maintainer's private delivery workspace, not published in this repo).
+/// generative model comes into scope.
 pub struct LlamaCppRuntime {
     base_url: String,
     http: reqwest::Client,
