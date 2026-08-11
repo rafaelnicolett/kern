@@ -277,7 +277,11 @@ async fn spawn_embedded_embedder() -> anyhow::Result<LlamaCppRuntime> {
         )
     })?;
     let port = pick_free_port()?;
-    LlamaCppRuntime::spawn(&binary, &model, port)
+    // 512 matches the bundled all-MiniLM-L6-v2's real architectural context
+    // window (verified against its GGUF metadata) — a temporary fixed
+    // value until the plug-and-play config work (kern config / the setup
+    // wizard) lets this be resolved per the actual configured model instead.
+    LlamaCppRuntime::spawn(&binary, &model, port, 512)
         .await
         .map_err(|e| anyhow::anyhow!("failed to start embedded backend (llama-server): {e}"))
 }

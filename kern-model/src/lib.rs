@@ -21,11 +21,27 @@ pub enum ModelError {
     // TODO: timeout variants, model not loaded, etc.
 }
 
+/// Ground-truth self-description of an `EmbeddingProvider` — never a static
+/// claim about "the" model kern assumes is running, always derived from a
+/// real round-trip against the actual backend. `max_input_tokens` is `None`
+/// when the backend genuinely can't report it; callers (kern-ingest's
+/// chunker) fall back to their own conservative default in that case.
+#[derive(Debug, Clone)]
+pub struct EmbeddingCapabilities {
+    pub model_id: String,
+    pub embedding_dim: usize,
+    pub max_input_tokens: Option<usize>,
+}
+
 /// Port consumed by kern-ingest to vectorize chunks.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, ModelError>;
     // TODO(kern-ingest): embed_batch to reduce round-trips to the subprocess.
+
+    /// Queried once per `serve` session at the composition root, not per
+    /// chunk — implementors may do a real round-trip to answer this.
+    async fn capabilities(&self) -> Result<EmbeddingCapabilities, ModelError>;
 }
 
 /// Entity/relation candidate extracted from a chunk — pre-classification.
@@ -64,6 +80,10 @@ pub enum JudgeDecision {
 /// Loaded lazily, unloaded after idling.
 #[async_trait]
 pub trait ExtractionProvider: Send + Sync {
+    /// Sync, zero I/O — known at construction. For display (`kern status`,
+    /// `kern config show`), not for any budget/capability decision.
+    fn model_id(&self) -> &str;
+
     async fn extract(
         &self,
         chunk: &str,
@@ -95,6 +115,8 @@ pub trait ExtractionProvider: Send + Sync {
 pub struct LlamaCppRuntime {
     base_url: String,
     http: reqwest::Client,
+    model_id: String,
+    context_size: u32,
     // Keeps the subprocess alive for the runtime's lifetime — dropping this
     // terminates the `llama-server` (kill_on_drop, see `spawn`).
     _child: tokio::process::Child,
@@ -119,11 +141,15 @@ impl LlamaCppRuntime {
     /// Starts `llama-server` pointing at the `.gguf` in `model_path`, on
     /// port `port` (localhost only), and waits for `/health` to respond OK
     /// before returning — never returns a runtime that isn't yet ready to
-    /// serve embeddings.
+    /// serve embeddings. `context_size` is passed explicitly as both `-c`
+    /// and `-b`/`-ub` — the caller decides it (kern has to know its own
+    /// backend's real limit, not guess), rather than silently inheriting
+    /// whatever llama-server's build default happens to be.
     pub async fn spawn(
         binary_path: &std::path::Path,
         model_path: &std::path::Path,
         port: u16,
+        context_size: u32,
     ) -> Result<Self, ModelError> {
         let mut child = tokio::process::Command::new(binary_path)
             .arg("-m")
@@ -133,6 +159,12 @@ impl LlamaCppRuntime {
             .arg(port.to_string())
             .arg("--host")
             .arg("127.0.0.1")
+            .arg("-c")
+            .arg(context_size.to_string())
+            .arg("-b")
+            .arg(context_size.to_string())
+            .arg("-ub")
+            .arg(context_size.to_string())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -175,9 +207,19 @@ impl LlamaCppRuntime {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
+        let model_id = format!(
+            "llama-cpp:{}",
+            model_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| model_path.display().to_string())
+        );
+
         Ok(Self {
             base_url,
             http,
+            model_id,
+            context_size,
             _child: child,
         })
     }
@@ -204,6 +246,20 @@ impl EmbeddingProvider for LlamaCppRuntime {
             .map(|d| d.embedding)
             .ok_or_else(|| ModelError::MalformedResponse("response without embeddings".to_string()))
     }
+
+    /// `max_input_tokens` is deterministic here — kern spawned this
+    /// subprocess itself with an explicit `-c`/`-b`, so it's just an echo,
+    /// no extra round-trip needed. `embedding_dim` still comes from a real
+    /// canary embed: never trust a static claim about "the" model's output
+    /// size when a real call can just confirm it.
+    async fn capabilities(&self) -> Result<EmbeddingCapabilities, ModelError> {
+        let dim = self.embed("kern capability probe").await?.len();
+        Ok(EmbeddingCapabilities {
+            model_id: self.model_id.clone(),
+            embedding_dim: dim,
+            max_input_tokens: Some(self.context_size as usize),
+        })
+    }
 }
 
 /// Opportunistic adapter — only used if the probe on `:11434` detects the
@@ -223,6 +279,24 @@ struct EmbedRequest<'a> {
 #[derive(Deserialize)]
 struct EmbedResponse {
     embeddings: Vec<Vec<f32>>,
+}
+
+#[derive(Serialize)]
+struct ShowRequest<'a> {
+    model: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ShowResponse {
+    /// Free-form, newline-separated `key value` pairs — e.g.
+    /// `"num_ctx                        256"`. This is Ollama's actual
+    /// *runtime* setting for the model, which can be tighter than the
+    /// model's architectural max reported in `model_info` (empirically
+    /// confirmed: `all-minilm`'s `model_info["bert.context_length"]` is
+    /// 512, but Ollama actually serves it with `num_ctx` 256 — reading
+    /// `model_info` alone would under-report the real, enforced limit).
+    parameters: Option<String>,
+    model_info: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 impl OllamaClient {
@@ -249,6 +323,45 @@ impl OllamaClient {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     }
+
+    async fn show(&self) -> Result<ShowResponse, ModelError> {
+        self.http
+            .post(format!("{}/api/show", self.base_url))
+            .json(&ShowRequest { model: &self.model })
+            .send()
+            .await?
+            .error_for_status()
+            .map_err(|e| ModelError::BackendUnavailable(e.to_string()))?
+            .json::<ShowResponse>()
+            .await
+            .map_err(ModelError::from)
+    }
+
+    /// `num_ctx` from the live `parameters` string first — the value Ollama
+    /// will actually enforce. Falls back to a `*.context_length` key in
+    /// `model_info` (the model's architectural max) only if `num_ctx` isn't
+    /// present. `None` if neither is parseable — a genuinely unknown limit,
+    /// not a guess.
+    fn parse_max_input_tokens(show: &ShowResponse) -> Option<usize> {
+        let from_params = show.parameters.as_deref().and_then(|params| {
+            params.lines().find_map(|line| {
+                let mut parts = line.split_whitespace();
+                if parts.next()? == "num_ctx" {
+                    parts.next()?.parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+        });
+        from_params.or_else(|| {
+            show.model_info.as_ref().and_then(|info| {
+                info.iter()
+                    .find(|(k, _)| k.ends_with(".context_length"))
+                    .and_then(|(_, v)| v.as_u64())
+                    .map(|n| n as usize)
+            })
+        })
+    }
 }
 
 #[async_trait]
@@ -273,6 +386,23 @@ impl EmbeddingProvider for OllamaClient {
             .into_iter()
             .next()
             .ok_or_else(|| ModelError::MalformedResponse("response without embeddings".to_string()))
+    }
+
+    async fn capabilities(&self) -> Result<EmbeddingCapabilities, ModelError> {
+        let dim = self.embed("kern capability probe").await?.len();
+        // A missing/unreachable /api/show shouldn't make an otherwise-working
+        // embedder unusable — max_input_tokens degrades to `None` (caller
+        // applies its own conservative default) rather than failing the
+        // whole capability probe.
+        let max_input_tokens = match self.show().await {
+            Ok(show) => Self::parse_max_input_tokens(&show),
+            Err(_) => None,
+        };
+        Ok(EmbeddingCapabilities {
+            model_id: format!("ollama:{}", self.model),
+            embedding_dim: dim,
+            max_input_tokens,
+        })
     }
 }
 
@@ -393,6 +523,10 @@ impl OllamaClient {
 
 #[async_trait]
 impl ExtractionProvider for OllamaClient {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     async fn extract(
         &self,
         chunk: &str,
@@ -513,19 +647,70 @@ impl OllamaClient {
     }
 }
 
-/// Active model backend — dispatch via enum, not `dyn Trait` (avoids the
-/// vtable cost on a call that already pays a subprocess/HTTP round-trip).
-pub enum ModelBackend {
-    Embedded(LlamaCppRuntime),
-    Ollama(OllamaClient),
+/// Which embedding backend to build, and what it needs to start. An
+/// open-ended alternative to a fixed dispatch enum (see docs/adr/0008) —
+/// `kern-cli`'s composition root picks one of these from persisted config
+/// (or a first-run wizard) instead of the previous hardcoded
+/// probe-then-fallback logic.
+#[derive(Debug, Clone)]
+pub enum EmbeddingProviderSelection {
+    Ollama {
+        model: String,
+        base_url: Option<String>,
+    },
+    LlamaCppEmbedded {
+        binary_path: std::path::PathBuf,
+        model_path: std::path::PathBuf,
+        port: u16,
+        context_size: u32,
+    },
 }
 
-#[async_trait]
-impl EmbeddingProvider for ModelBackend {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, ModelError> {
-        match self {
-            ModelBackend::Embedded(runtime) => runtime.embed(text).await,
-            ModelBackend::Ollama(client) => client.embed(text).await,
+pub async fn build_embedding_provider(
+    selection: EmbeddingProviderSelection,
+) -> Result<std::sync::Arc<dyn EmbeddingProvider>, ModelError> {
+    match selection {
+        EmbeddingProviderSelection::Ollama { model, base_url } => {
+            let client = match base_url {
+                Some(url) => OllamaClient::with_base_url(url, model),
+                None => OllamaClient::new(model),
+            };
+            Ok(std::sync::Arc::new(client))
+        }
+        EmbeddingProviderSelection::LlamaCppEmbedded {
+            binary_path,
+            model_path,
+            port,
+            context_size,
+        } => {
+            let runtime =
+                LlamaCppRuntime::spawn(&binary_path, &model_path, port, context_size).await?;
+            Ok(std::sync::Arc::new(runtime))
+        }
+    }
+}
+
+/// Only one real backend implements `ExtractionProvider` today (Ollama) —
+/// kept as an enum rather than skipping straight to a bare `OllamaClient`
+/// constructor for the same "keep the door open" reasoning ADR-0001 already
+/// applied to `ExtractionProvider` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionProviderKind {
+    Ollama,
+}
+
+pub async fn build_extraction_provider(
+    kind: ExtractionProviderKind,
+    model: String,
+    base_url: Option<String>,
+) -> Result<std::sync::Arc<dyn ExtractionProvider>, ModelError> {
+    match kind {
+        ExtractionProviderKind::Ollama => {
+            let client = match base_url {
+                Some(url) => OllamaClient::with_base_url(url, model),
+                None => OllamaClient::new(model),
+            };
+            Ok(std::sync::Arc::new(client))
         }
     }
 }
@@ -555,6 +740,41 @@ mod tests {
 
         assert!(!embedding.is_empty());
         assert_eq!(embedding.len(), kern_vector_embedding_dim_hint());
+    }
+
+    /// Confirms a real, previously-unverified assumption this whole
+    /// capability design rests on: Ollama's `/api/show` reports the model's
+    /// *architectural* max in `model_info["bert.context_length"]` (512 for
+    /// all-minilm), separately from the *runtime* `num_ctx` it actually
+    /// enforces (256, confirmed against the real running `llama-server`
+    /// process args: `-c 256 -b 256`). `capabilities()` must surface 256,
+    /// not 512 — reading the architectural max alone would under-budget
+    /// the chunker and the real embed call would still fail.
+    #[tokio::test]
+    async fn ollama_capabilities_reports_runtime_num_ctx_not_architectural_max() {
+        let client = OllamaClient::new("all-minilm");
+        if !client.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let caps = match client.capabilities().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("all-minilm model unavailable ({e}) — skipping integration test");
+                return;
+            }
+        };
+
+        assert_eq!(caps.embedding_dim, 384);
+        assert_eq!(
+            caps.max_input_tokens,
+            Some(256),
+            "expected Ollama's real runtime num_ctx (256), not bert.context_length's \
+             architectural max (512) — if this changed, Ollama's default deployment \
+             config for all-minilm changed, re-verify manually before updating"
+        );
+        assert_eq!(caps.model_id, "ollama:all-minilm");
     }
 
     /// Keeps the test honest about the expected dimension without coupling
@@ -602,7 +822,7 @@ mod tests {
             return;
         };
 
-        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8791)
+        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8791, 512)
             .await
             .expect("llama-server should start and become ready within the timeout");
 
@@ -614,11 +834,11 @@ mod tests {
         assert!(!embedding.is_empty());
     }
 
-    /// `ModelBackend::Embedded` should actually delegate to `LlamaCppRuntime`
-    /// — it's no longer a fixed error stub (the `BackendUnavailable`
-    /// placeholder was removed).
+    /// `capabilities()` on the embedded backend is deterministic (echoes
+    /// the `context_size` it was spawned with) but `embedding_dim` still
+    /// has to come from a real canary embed — assert both.
     #[tokio::test]
-    async fn model_backend_embedded_delegates_to_real_llama_cpp_runtime() {
+    async fn llama_cpp_runtime_capabilities_reports_spawned_context_size_and_real_dim() {
         let Some(binary) = find_llama_server_binary() else {
             eprintln!("llama-server not found on PATH — skipping integration test");
             return;
@@ -631,17 +851,18 @@ mod tests {
             return;
         };
 
-        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8792)
+        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8792, 512)
             .await
             .expect("llama-server should start and become ready within the timeout");
-        let backend = ModelBackend::Embedded(runtime);
 
-        let embedding = backend
-            .embed("test via ModelBackend::Embedded")
+        let caps = runtime
+            .capabilities()
             .await
-            .expect("embed via ModelBackend should return a valid vector");
+            .expect("capabilities should succeed against a real running llama-server");
 
-        assert!(!embedding.is_empty());
+        assert_eq!(caps.max_input_tokens, Some(512));
+        assert!(caps.embedding_dim > 0);
+        assert!(caps.model_id.contains("bge-small-en-v1.5-q4_k_m.gguf"));
     }
 
     /// Real integration against Ollama — `llama3.2` is a common generative
