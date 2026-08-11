@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-kern-model.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true

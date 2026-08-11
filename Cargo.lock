@@ -2792,7 +2792,6 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "blake3",
- "kern-model",
  "notify",
  "pulldown-cmark",
  "serde",
