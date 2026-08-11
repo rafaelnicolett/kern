@@ -369,7 +369,8 @@ short template string) is open work.
    structured logs and traces (`tracing` crate — not yet wired to an
    OpenTelemetry exporter, see [ADR-0005](docs/adr/0005-observability-from-v0.md)).
 3. MCP over stdio, with the six tools above.
-4. A minimal CLI: `project create`, `serve`, `status`.
+4. A minimal CLI: `project create` (with guided or non-interactive
+   provider setup), `serve`, `status`, `config show|set-embedding|set-extraction`.
 
 **Deliberately out of scope for v0**: a GUI/desktop app, a local HTTP API,
 multi-process/multi-client coordination, and built-in document conversion
@@ -378,17 +379,96 @@ never a library compiled into kern).
 
 ## Workspace layout
 
-```
-kern-ingest/     file watcher + markdown-aware chunking
-kern-vector/     wrapper around the embedded LanceDB vector store
-kern-ontology/   type registry, relation vocabulary, incremental diff engine
-kern-model/      EmbeddingProvider/ExtractionProvider traits, bundled llama-server subprocess, opportunistic Ollama adapter
-kern-mcp/        MCP server (rmcp) exposing the agent-facing tools
-kern-cli/        the `kern` binary: project create, serve, status
-```
-
 Hexagonal architecture (ports & adapters), traits-first — see [`docs/adr/`](docs/adr)
-for the decision history.
+for the decision history, in particular [ADR-0001](docs/adr/0001-hexagonal-reference-architecture.md)
+(the overall shape), [ADR-0008](docs/adr/0008-pluggable-local-model-providers.md)
+(provider capability + selection) and [ADR-0009](docs/adr/0009-per-project-embedding-dimension-pinning.md)
+(dimension pinning).
+
+### `kern-ingest` — watching and chunking
+
+- `Watcher`: event-driven folder watching (via `notify`), never polling.
+- `is_real_change`: content-hash diff (blake3) — a touch with no real
+  content change never triggers reprocessing.
+- `StructuralMarkdownChunker`: splits a document at heading boundaries,
+  never cutting a code block or table in half.
+- `BudgetAwareMarkdownChunker`: a decorator around the above that
+  sub-splits any chunk exceeding the active model's real token budget —
+  paragraph boundaries first, then sentences, then a hard UTF-8-safe cut
+  as the last resort — while still never splitting a code block or table,
+  even under budget pressure.
+- `TokenCounter` port: how chunk size is estimated is itself pluggable;
+  `HeuristicTokenCounter` (chars/4) is the only implementation today, with
+  the door left open for a real per-model tokenizer later.
+
+### `kern-vector` — the embedded vector index
+
+- `LanceVectorStore`: a thin wrapper over embedded LanceDB, one directory
+  per project (`<project>/.kern/vectors/`) — no external server, no FFI.
+- `search_hybrid`: vector similarity search fused with a keyword-match
+  boost via Reciprocal Rank Fusion, so an exact-term match can outrank a
+  vectorially-closer chunk with no shared term.
+- `ensure_table`/`existing_dimension`: table creation is deferred until a
+  real embedding dimension is known, and pinned per project — a mismatch
+  (switching to a differently-dimensioned model) is a clear error, never a
+  silent truncate/rebuild of the existing index.
+
+### `kern-ontology` — the incremental type system
+
+- `TypeRepository`/`InstanceRepository` (SQLite-backed): the entity-type
+  registry, relation vocabulary, and instance graph.
+- `OntologyEngine`: for each candidate, decides merge into an existing
+  type / promote to a new type / ask `judge()` — the fallback path,
+  reserved for the genuinely ambiguous middle (see
+  [BENCHMARKS.md](BENCHMARKS.md) for the real fallback-rate measurement).
+- `process_frontmatter`: deterministic — frontmatter fields that map to a
+  known concept (`id`, `kind`, `depends_on`, `implements`, ...) become
+  real entities and relations with no model call beyond the one-time,
+  cached interpretation of a new frontmatter *shape*.
+- `process_chunk`: the free-form prose path — real LLM extraction +
+  distance-based classification for content with no frontmatter to parse.
+
+### `kern-model` — the pluggable provider layer
+
+- `EmbeddingProvider`/`ExtractionProvider` ports, each with a concrete
+  local adapter: `OllamaClient` (both traits, opportunistic — used only if
+  a daemon responds on `:11434`) and `LlamaCppRuntime` (embedding only,
+  spawns the bundled `llama-server` subprocess).
+- `capabilities()`: real, ground-truth self-description (model id,
+  embedding dimension, max input tokens) — always a live round-trip
+  against the actual backend, never a static assumption about "the" model.
+- `EmbeddingProviderSelection`/`ExtractionProviderKind` +
+  `build_embedding_provider`/`build_extraction_provider`: open-ended
+  factories `kern-cli`'s composition root uses to build a real provider
+  from persisted config — adding a new local engine is one enum variant
+  and one factory arm, not a rewrite of the call sites.
+
+### `kern-mcp` — the agent-facing surface
+
+The MCP server (built on `rmcp`), exposing six tools over stdio — see
+[MCP tools](#mcp-tools) below and the full contract at
+[`docs/architecture/mcp-tool-contract.md`](docs/architecture/mcp-tool-contract.md).
+
+### `kern-cli` — the `kern` binary
+
+- `project create`: creates an isolated project (its own SQLite state +
+  vector index) **and** resolves its model provider in the same step — a
+  guided terminal wizard when interactive, explicit
+  `--embedding-provider`/`--embedding-model` flags otherwise. Never
+  persists a configuration that hasn't been proven to work against a real
+  round-trip.
+- `serve`: catches up on any backlog (chunk, embed, index, enrich), then
+  exposes MCP over stdio. Loads the project's pinned provider
+  configuration — no runtime auto-fallback if it becomes unreachable.
+- `status`: project health from persisted state alone (chunk count, entity
+  and relation type counts, the active provider/model/dimension) — works
+  even without a `serve` running.
+- `config show|set-embedding|set-extraction`: inspect or reconfigure an
+  existing project's provider later.
+- `embedded`: manages the bundled `llama-server` extraction and the
+  `~/.cache/kern/models/` lookup (including sidecar-model adoption from a
+  `with-embedding-model` release tarball) that back the
+  `llama_cpp_embedded` provider.
 
 ## Benchmarks
 
