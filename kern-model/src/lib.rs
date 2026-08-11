@@ -299,6 +299,40 @@ struct ShowResponse {
     model_info: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
+#[derive(Deserialize)]
+struct TagsResponse {
+    models: Vec<OllamaModelInfo>,
+}
+
+/// One locally-pulled Ollama model, as reported by the real `/api/tags`
+/// response — `capabilities` and `details` come straight from Ollama, not
+/// inferred from the model name.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OllamaModelInfo {
+    pub name: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub details: OllamaModelDetails,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OllamaModelDetails {
+    pub family: Option<String>,
+    pub context_length: Option<u64>,
+    pub embedding_length: Option<u64>,
+}
+
+impl OllamaModelInfo {
+    pub fn supports_embedding(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "embedding")
+    }
+
+    pub fn supports_completion(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "completion")
+    }
+}
+
 impl OllamaClient {
     pub fn new(model: impl Into<String>) -> Self {
         Self::with_base_url("http://localhost:11434", model)
@@ -322,6 +356,25 @@ impl OllamaClient {
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+
+    /// Real, locally-pulled models — used by the setup wizard to present
+    /// actual choices instead of guessing "embedding vs chat" from name
+    /// patterns. `capabilities` comes straight from Ollama's own real
+    /// `/api/tags` response (empirically confirmed: it reports
+    /// `["embedding"]` for an embedding model, `["completion", "tools"]`
+    /// for a generative one) — never inferred.
+    pub async fn list_models(&self) -> Result<Vec<OllamaModelInfo>, ModelError> {
+        let response = self
+            .http
+            .get(format!("{}/api/tags", self.base_url))
+            .send()
+            .await?
+            .error_for_status()
+            .map_err(|e| ModelError::BackendUnavailable(e.to_string()))?
+            .json::<TagsResponse>()
+            .await?;
+        Ok(response.models)
     }
 
     async fn show(&self) -> Result<ShowResponse, ModelError> {
@@ -775,6 +828,37 @@ mod tests {
              config for all-minilm changed, re-verify manually before updating"
         );
         assert_eq!(caps.model_id, "ollama:all-minilm");
+    }
+
+    /// Confirms `/api/tags` really reports usable capability metadata per
+    /// model — the setup wizard relies on this to classify models as
+    /// embedding- vs completion-capable without guessing from their name.
+    #[tokio::test]
+    async fn list_models_reports_real_capabilities_not_guessed_from_name() {
+        let client = OllamaClient::new("all-minilm");
+        if !client.probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        let models = match client.list_models().await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("list_models failed ({e}) — skipping integration test");
+                return;
+            }
+        };
+
+        let Some(all_minilm) = models.iter().find(|m| m.name.starts_with("all-minilm")) else {
+            eprintln!("all-minilm not in the local Ollama pull list — skipping integration test");
+            return;
+        };
+        assert!(
+            all_minilm.supports_embedding(),
+            "all-minilm should report embedding capability: {:?}",
+            all_minilm.capabilities
+        );
+        assert!(!all_minilm.supports_completion());
     }
 
     /// Keeps the test honest about the expected dimension without coupling

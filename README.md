@@ -78,16 +78,28 @@ into an existing type, promote to a new one, or discard. See
 
 ### Model backend
 
-kern needs a local model for embeddings (and, lazily, for ontology
-extraction/judging). It resolves one automatically, and never falls back
-silently — if nothing usable is found, `kern serve` fails with a clear
-error instead of guessing:
+kern needs a local model for embeddings (and, optionally, for ontology
+extraction/judging) — configured once per project, not guessed at
+`serve` time. `kern project create` resolves it as part of creation:
 
-- **Ollama, if available** — if a daemon is already responding on
-  `:11434`, kern uses it opportunistically. This is the easiest path
-  today: `ollama pull all-minilm` for embeddings, and optionally
+- **Interactively** (a real terminal, no provider flags) — a guided setup
+  wizard detects what's actually available locally (a real `Ollama`
+  `/api/tags` probe, listing your actually-pulled models with their real
+  reported capabilities — never guessed from the model name — plus the
+  bundled engine if a `.gguf` is cached) and lets you pick.
+- **Non-interactively** — pass `--embedding-provider <ollama|llama_cpp_embedded>
+  --embedding-model <name>` (and optionally `--extraction-provider ollama
+  --extraction-model <name>`) directly; required when stdin isn't a
+  terminal, so scripted/CI usage never hangs waiting for input that can't
+  arrive.
+
+Either way, kern proves the provider actually works — a real embedding
+call, dimension included — **before** persisting anything to
+`.kern/config.toml`. Two real local engines are supported today:
+
+- **Ollama** — `ollama pull all-minilm` for embeddings, and optionally
   `ollama pull llama3.2` for ontology extraction/judging.
-- **Bundled engine, otherwise** — release binaries embed a
+- **Bundled engine** — release binaries embed a
   [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`,
   extracted to `~/.cache/kern/bin/` on first use, no separate install. The
   embedding *weights* still have to come from somewhere:
@@ -102,11 +114,24 @@ error instead of guessing:
     run Ollama, or place a compatible embedding `.gguf` under
     `~/.cache/kern/models/` by hand.
 
-This only closes the gap for **embeddings**. Ontology extraction/judging
-has no bundled backend yet — that path still needs Ollama regardless of
-which tarball you use. There is also still no *runtime* automatic download
-from Hugging Face — the with-embedding-model tarball is a build-time
-bundling choice, not download-on-demand.
+This still only closes the zero-setup gap for **embeddings**: the bundled
+engine has no extraction/judging backend, so that path needs Ollama
+regardless of which tarball you use. There's also still no *runtime*
+automatic download from Hugging Face — the with-embedding-model tarball is
+a build-time bundling choice, not download-on-demand.
+
+Once configured, the choice is pinned — `kern serve` never silently swaps
+providers or falls back if the configured one becomes unreachable (a
+deliberate change from earlier v0 behavior), and switching a project's
+embedding model to a different real dimension requires an explicit
+re-index (`kern config set-embedding` fails clearly rather than corrupting
+the existing index). See `kern config show|set-embedding|set-extraction
+--project <name>` to inspect or change an existing project's
+configuration.
+
+Whatever the source, chunk sizing itself adapts to the configured
+provider's real, reported context window — never a hardcoded assumption
+about how much text any given backend can accept in one call.
 
 ## Installing
 
@@ -153,7 +178,9 @@ it needs the embedded backend, and adopts it into `~/.cache/kern/models/`:
 
 ```bash
 cd kern-aarch64-apple-darwin-with-embedding-model
-./kern project create acme --path ./docs/acme
+./kern project create acme --path ./docs/acme \
+  --embedding-provider llama_cpp_embedded \
+  --embedding-model all-MiniLM-L6-v2-ggml-model-f16.gguf
 ./kern serve --project acme
 ```
 
@@ -184,8 +211,14 @@ cargo build --release -p kern-cli
 
 ## Quick start
 
+`kern project create` resolves your model provider as part of creating the
+project — see [Model backend](#model-backend). Interactively, in a real
+terminal:
+
 ```bash
-# 1. Create a project — an isolated index + ontology over one folder
+# 1. Create a project — an isolated index + ontology over one folder.
+# With no --embedding-provider/--embedding-model flags and a real TTY,
+# this launches a guided setup wizard.
 kern project create acme --path ./docs/acme
 
 # 2. Serve it: catches up on any backlog, then exposes MCP over stdio
@@ -195,25 +228,28 @@ kern serve --project acme
 kern status --project acme
 ```
 
+Non-interactively (scripts, CI — required when stdin isn't a terminal,
+kern fails fast rather than hanging on input that can't arrive):
+
+```bash
+kern project create acme --path ./docs/acme \
+  --embedding-provider ollama --embedding-model all-minilm \
+  --extraction-provider ollama --extraction-model llama3.2   # optional
+```
+
 `kern serve` blocks, speaking MCP JSON-RPC over stdio — it's meant to be
 launched by an MCP host, not run interactively in a terminal you're typing
 into. See below for wiring it up.
 
-Before the first `serve`, resolve a model backend per
-[Model backend](#model-backend): `ollama pull all-minilm` (and optionally
-`llama3.2`), the
-[`kern-<target>-with-embedding-model`](#zero-setup-embeddings-no-ollama)
-release tarball (embeddings only, zero manual steps), or a manually cached
-`.gguf` — `kern serve` has nothing to fall back on otherwise, and fails
-with a clear error rather than hanging.
-
 **v0 target**: install-to-useful-`query_ontological`-response should take
 about 2 minutes. For the **embedding** path, that's met today by the
-with-embedding-model tarball (see
-[BENCHMARKS.md](BENCHMARKS.md#3-time-to-useful-response) for a real
-measurement) — no manual `ollama pull` or `.gguf` placement needed.
-**Ontology extraction/judging** still needs Ollama regardless of tarball;
-that half of the v0 target isn't met yet.
+[`kern-<target>-with-embedding-model`](#zero-setup-embeddings-no-ollama)
+release tarball (see [BENCHMARKS.md](BENCHMARKS.md#3-time-to-useful-response)
+for a real measurement) — no manual `ollama pull` or `.gguf` placement
+needed, just picking it in the wizard (or passing
+`--embedding-provider llama_cpp_embedded --embedding-model <the .gguf
+file's name>`). **Ontology extraction/judging** still needs Ollama
+regardless of tarball; that half of the v0 target isn't met yet.
 
 ### Connecting an MCP host
 

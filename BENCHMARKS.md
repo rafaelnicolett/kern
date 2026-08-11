@@ -19,10 +19,15 @@
 - **Model backend**: Ollama (`all-minilm` for embeddings, `llama3.2` for
   extraction/judging/frontmatter-schema interpretation) — the opportunistic
   path, not the bundled `llama-server` path.
-- **Command**: `kern project create demo --path examples/sample-specs`
-  then `kern serve --project demo`, driven over real MCP stdio (not a
-  mock) — see the transcript driver referenced in the README's
-  [Examples](README.md#examples) section.
+- **Command**: `kern project create demo --path examples/sample-specs
+  --embedding-provider ollama --embedding-model all-minilm
+  --extraction-provider ollama --extraction-model llama3.2` then `kern
+  serve --project demo`, driven over real MCP stdio (not a mock) — see the
+  transcript driver referenced in the README's
+  [Examples](README.md#examples) section. Provider setup (`project
+  create`) is a one-time step per project, timed separately from
+  everything below — every number here is from `kern serve` onward, not
+  including it.
 - Every run starts from a cold project (`.kern/` deleted first) — no
   benchmark here measures a warm/incremental re-index.
 

@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use kern_ingest::{MarkdownChunker, StructuralMarkdownChunker};
+use kern_ingest::{
+    BudgetAwareMarkdownChunker, HeuristicTokenCounter, MarkdownChunker, StructuralMarkdownChunker,
+};
 use kern_mcp::KernServer;
-use kern_model::{EmbeddingProvider, ExtractionProvider, LlamaCppRuntime, OllamaClient};
+use kern_model::{EmbeddingProvider, ExtractionProvider};
 use kern_ontology::{
     AmbiguousZoneConfig, OntologyEngine, SqliteFrontmatterProfileRepository,
     SqliteInstanceRepository, SqliteTypeRepository, TypeRepository,
@@ -18,7 +20,9 @@ use kern_ontology::{
 use kern_vector::{ChunkRecord, LanceVectorStore, VectorStore};
 use tracing_subscriber::EnvFilter;
 
+mod config;
 mod embedded;
+mod setup;
 
 /// Process states — strictly sequential transitions, no going back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,15 +61,74 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Reads or changes a project's model provider configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[derive(Subcommand)]
 enum ProjectAction {
-    /// Creates an isolated project — name must be unique on the local machine.
+    /// Creates an isolated project — name must be unique on the local
+    /// machine — and resolves its model provider configuration in the
+    /// same step. Interactively (a real terminal, no provider flags
+    /// given): a guided setup wizard. Non-interactively (flags given, or
+    /// no TTY): `--embedding-provider`/`--embedding-model` are required.
     Create {
         name: String,
         #[arg(long)]
         path: PathBuf,
+        /// "ollama" or "llama_cpp_embedded" — skips the interactive
+        /// embedding step when given together with `--embedding-model`.
+        #[arg(long)]
+        embedding_provider: Option<String>,
+        /// Required alongside `--embedding-provider` for a uniform CLI
+        /// shape, but for "llama_cpp_embedded" the value isn't used to
+        /// pick among multiple cached models today — the resolver always
+        /// takes the first `.gguf` found (alphabetically) in
+        /// `~/.cache/kern/models`/next to the running executable. Matters
+        /// for "ollama", where it's the real model tag.
+        #[arg(long)]
+        embedding_model: Option<String>,
+        /// Only "ollama" is real today. Omit both this and
+        /// `--extraction-model` to skip extraction/judging for this
+        /// project non-interactively (it's optional).
+        #[arg(long)]
+        extraction_provider: Option<String>,
+        #[arg(long)]
+        extraction_model: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Prints the project's persisted provider configuration.
+    Show {
+        #[arg(long)]
+        project: String,
+    },
+    /// Reconfigures an existing project's embedding provider. If the new
+    /// provider reports a different dimension than what the project was
+    /// already indexed with, this fails clearly rather than corrupting
+    /// the index — delete `.kern/vectors` first to actually switch.
+    SetEmbedding {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+    },
+    /// Reconfigures (or removes, with no flags) an existing project's
+    /// extraction/judging provider.
+    SetExtraction {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -98,7 +161,15 @@ fn save_registry(registry: &HashMap<String, PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_project_create(name: String, path: PathBuf) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn cmd_project_create(
+    name: String,
+    path: PathBuf,
+    embedding_provider: Option<String>,
+    embedding_model: Option<String>,
+    extraction_provider: Option<String>,
+    extraction_model: Option<String>,
+) -> anyhow::Result<()> {
     let mut registry = load_registry()?;
     // Name must be unique within the local machine scope.
     if registry.contains_key(&name) {
@@ -114,17 +185,70 @@ async fn cmd_project_create(name: String, path: PathBuf) -> anyhow::Result<()> {
     types.seed_canonical_vocabulary().await?;
     let _instances = SqliteInstanceRepository::open(&db_path)?;
     let _frontmatter = SqliteFrontmatterProfileRepository::open(&db_path)?;
+
+    let embedding_choice = match (embedding_provider, embedding_model) {
+        (Some(provider), Some(model)) => Some(parse_embedding_choice(&provider, model)?),
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "AGENT_SURFACE.INCOMPLETE_PROVIDER_FLAGS: pass both --embedding-provider and \
+             --embedding-model together, or neither for the guided setup"
+        ),
+    };
+    let embedding = setup::resolve_embedding_config(embedding_choice).await?;
+
+    let extraction_choice = match (extraction_provider, extraction_model) {
+        (Some(provider), Some(model)) => Some(parse_extraction_choice(&provider, model)?),
+        (None, None) if !std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            Some(setup::ExtractionChoice::Skip)
+        }
+        (None, None) => None, // interactive — the wizard asks
+        _ => anyhow::bail!(
+            "AGENT_SURFACE.INCOMPLETE_PROVIDER_FLAGS: pass both --extraction-provider and \
+             --extraction-model together, or neither to skip extraction"
+        ),
+    };
+    let extraction = setup::resolve_extraction_config(extraction_choice).await?;
+
     let mut vectors = LanceVectorStore::open(&path.join(".kern").join("vectors")).await?;
-    // 384 is a temporary bridge value — the plug-and-play config work (kern
-    // config / the setup wizard) will pin this from the actually configured
-    // provider's real EmbeddingCapabilities instead of a fixed literal.
-    vectors.ensure_table(384).await?;
+    vectors.ensure_table(embedding.dimension).await?;
+
+    config::save(
+        &path,
+        &config::ProjectConfig {
+            schema_version: 1,
+            embedding,
+            extraction,
+        },
+    )?;
 
     registry.insert(name.clone(), path.clone());
     save_registry(&registry)?;
 
     println!("project '{name}' created at {}", path.display());
     Ok(())
+}
+
+fn parse_embedding_choice(provider: &str, model: String) -> anyhow::Result<setup::EmbeddingChoice> {
+    match provider {
+        "ollama" => Ok(setup::EmbeddingChoice::Ollama { model }),
+        "llama_cpp_embedded" => Ok(setup::EmbeddingChoice::LlamaCppEmbedded),
+        other => anyhow::bail!(
+            "AGENT_SURFACE.UNKNOWN_PROVIDER: '{other}' — expected \"ollama\" or \
+             \"llama_cpp_embedded\""
+        ),
+    }
+}
+
+fn parse_extraction_choice(
+    provider: &str,
+    model: String,
+) -> anyhow::Result<setup::ExtractionChoice> {
+    match provider {
+        "ollama" => Ok(setup::ExtractionChoice::Ollama { model }),
+        other => {
+            anyhow::bail!("AGENT_SURFACE.UNKNOWN_PROVIDER: '{other}' — expected \"ollama\"")
+        }
+    }
 }
 
 fn resolve_project(name: &str) -> anyhow::Result<PathBuf> {
@@ -137,11 +261,10 @@ fn resolve_project(name: &str) -> anyhow::Result<PathBuf> {
 
 /// CatchUpScan — reuses the same hash-diff as the watcher to recover from
 /// lag. Chunk+embed+index always happens. Ontology enrichment only happens when `ontology_engine` is
-/// `Some` — it is `None` when Ollama is not available (the embedded
-/// backend only covers embedding, see `spawn_embedded_embedder`). An
-/// isolated enrichment failure on one file/chunk never aborts the vector
-/// indexing of the rest — it's an enhancement, not a requirement for a
-/// chunk to become searchable.
+/// `Some` — it is `None` when no extraction provider is configured for
+/// this project. An isolated enrichment failure on one file/chunk never
+/// aborts the vector indexing of the rest — it's an enhancement, not a
+/// requirement for a chunk to become searchable.
 ///
 /// Two enrichment paths, not one:
 /// - **Frontmatter** (`OntologyEngine::process_frontmatter`) runs once per
@@ -158,13 +281,17 @@ fn resolve_project(name: &str) -> anyhow::Result<PathBuf> {
 ///   syntax words, not real entities). Every other chunk of the file
 ///   (the real body content) still goes through prose extraction as
 ///   normal.
+///
+/// `chunker` is budget-aware, sourced from the active embedding provider's
+/// real `capabilities()` at the call site — never a hardcoded assumption
+/// about how much any given backend can accept in one call.
 async fn catch_up_scan(
     root: &Path,
     vector_store: &dyn VectorStore,
     embedder: &dyn EmbeddingProvider,
     ontology_engine: Option<&OntologyEngine>,
+    chunker: &dyn MarkdownChunker,
 ) -> anyhow::Result<usize> {
-    let chunker = StructuralMarkdownChunker;
     let mut indexed = 0usize;
 
     for entry in walk_markdown_files(root)? {
@@ -261,36 +388,7 @@ fn walk_markdown_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Last resort when Ollama doesn't respond: extracts `llama-server` (only
-/// exists in release builds with the `bundled-llama-server` feature) and
-/// starts it against a `.gguf` already in the local cache. Never attempts
-/// to download anything from the network — fails explicitly and
-/// immediately if a piece is missing (see BDD: "First run without
-/// internet fails clearly" — no silent fallback).
-async fn spawn_embedded_embedder() -> anyhow::Result<LlamaCppRuntime> {
-    let binary = embedded::ensure_llama_server_binary().map_err(|e| {
-        anyhow::anyhow!("no model backend available: Ollama is not responding on :11434 and {e}")
-    })?;
-    let model = embedded::resolve_model()?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "AGENT_SURFACE.MODEL_MISSING_FROM_CACHE: no .gguf found in \
-             ~/.cache/kern/models, and no sidecar .gguf next to the running executable — \
-             download the kern-<target>-with-embedding-model release tarball for a \
-             zero-setup embedded model, or populate ~/.cache/kern/models by hand before \
-             running without Ollama"
-        )
-    })?;
-    let port = pick_free_port()?;
-    // 512 matches the bundled all-MiniLM-L6-v2's real architectural context
-    // window (verified against its GGUF metadata) — a temporary fixed
-    // value until the plug-and-play config work (kern config / the setup
-    // wizard) lets this be resolved per the actual configured model instead.
-    LlamaCppRuntime::spawn(&binary, &model, port, 512)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to start embedded backend (llama-server): {e}"))
-}
-
-fn pick_free_port() -> anyhow::Result<u16> {
+pub(crate) fn pick_free_port() -> anyhow::Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
 }
@@ -302,26 +400,37 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
     let root = resolve_project(&project)?;
     let db_path = root.join(".kern").join("registry.db");
 
-    // A single probe decides both: Ollama serves as embedder and as
-    // extractor (llama3.2). The embedded backend (LlamaCppRuntime) only
-    // implements EmbeddingProvider — without Ollama, vector indexing keeps
-    // working, but ontology enrichment is disabled for this session (see
-    // catch_up_scan).
-    let ollama_available = OllamaClient::new("all-minilm").probe().await;
-    let embedder: Arc<dyn EmbeddingProvider> = if ollama_available {
-        Arc::new(OllamaClient::new("all-minilm"))
-    } else {
-        Arc::new(spawn_embedded_embedder().await?)
-    };
-    let extraction: Option<Arc<dyn ExtractionProvider>> = if ollama_available {
-        Some(Arc::new(OllamaClient::new("llama3.2")))
-    } else {
-        tracing::warn!(
-            "Ollama unavailable — ontology enrichment (extract/judge) disabled for this \
-             session; vector indexing continues normally"
+    let project_config = config::load(&root)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "AGENT_SURFACE.PROJECT_NOT_CONFIGURED: no .kern/config.toml for '{project}' — run \
+             `kern config set-embedding --project {project} --provider <ollama|llama_cpp_embedded> \
+             --model <name>` (this project predates provider configuration)"
+        )
+    })?;
+    // No silent runtime fallback if the configured provider is
+    // unreachable — a deliberate change from the old hardcoded
+    // probe-then-fallback behavior. Once pinned (at `project create` or
+    // `kern config set-embedding` time), an unreachable provider is a
+    // hard error, never a silent swap to a differently-dimensioned
+    // backend (see kern-vector's dimension pinning).
+    let (embedder, extraction): (
+        Arc<dyn EmbeddingProvider>,
+        Option<Arc<dyn ExtractionProvider>>,
+    ) = setup::build_providers_from_config(&project_config).await?;
+    if extraction.is_none() {
+        tracing::info!(
+            "no extraction provider configured for this project — ontology enrichment \
+             disabled for this session; vector indexing continues normally"
         );
-        None
-    };
+    }
+
+    let caps = embedder.capabilities().await?;
+    let budget = caps.max_input_tokens.unwrap_or(256);
+    let chunker = BudgetAwareMarkdownChunker::new(
+        StructuralMarkdownChunker,
+        Box::new(HeuristicTokenCounter),
+        budget,
+    );
 
     let types: Arc<dyn TypeRepository> = Arc::new(SqliteTypeRepository::open(&db_path)?);
     let instances: Arc<dyn kern_ontology::InstanceRepository> =
@@ -329,8 +438,9 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
     let frontmatter_profiles: Arc<dyn kern_ontology::FrontmatterProfileRepository> =
         Arc::new(SqliteFrontmatterProfileRepository::open(&db_path)?);
     let mut lance_store = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
-    // 384 is a temporary bridge value — see cmd_project_create.
-    lance_store.ensure_table(384).await?;
+    lance_store
+        .ensure_table(project_config.embedding.dimension)
+        .await?;
     let vector_store: Arc<dyn VectorStore> = Arc::new(lance_store);
 
     let ontology_engine = extraction.map(|extraction| {
@@ -351,6 +461,7 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
         vector_store.as_ref(),
         embedder.as_ref(),
         ontology_engine.as_ref(),
+        &chunker,
     )
     .await?;
     tracing::info!(chunks_indexed = indexed, "catch-up complete");
@@ -396,9 +507,10 @@ async fn cmd_status(project: Option<String>) -> anyhow::Result<()> {
     let root = resolve_project(&name)?;
     let db_path = root.join(".kern").join("registry.db");
     let types = SqliteTypeRepository::open(&db_path)?;
-    let mut vector_store = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
-    // 384 is a temporary bridge value — see cmd_project_create.
-    vector_store.ensure_table(384).await?;
+    // Read-only: `open` already populates the table if it exists on disk —
+    // no `ensure_table` call needed (that's only for creating one), and no
+    // dimension has to be guessed just to report status.
+    let vector_store = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
 
     let entity_types = types.list_entity_types().await?;
     let relation_types = types.list_relation_types().await?;
@@ -406,9 +518,28 @@ async fn cmd_status(project: Option<String>) -> anyhow::Result<()> {
         .iter()
         .filter(|t| t.status == kern_ontology::RelationTypeStatus::Canonical)
         .count();
-    let chunk_count = vector_store.count().await?;
+    let chunk_count = match vector_store.existing_dimension().await? {
+        Some(_) => vector_store.count().await?,
+        None => 0,
+    };
 
     println!("project: {name} ({})", root.display());
+    match config::load(&root)? {
+        Some(cfg) => {
+            println!(
+                "embedding: {} via {} ({}-dim)",
+                cfg.embedding.model, cfg.embedding.provider, cfg.embedding.dimension
+            );
+            match &cfg.extraction {
+                Some(ext) => println!("extraction: {} via {}", ext.model, ext.provider),
+                None => println!("extraction: not configured"),
+            }
+        }
+        None => println!(
+            "provider: not configured — run `kern config set-embedding --project {name} \
+             --provider <ollama|llama_cpp_embedded> --model <name>`"
+        ),
+    }
     println!("chunks indexed: {chunk_count}");
     println!(
         "entity types: {} | relation types: {} ({canonical} canonical)",
@@ -419,6 +550,90 @@ async fn cmd_status(project: Option<String>) -> anyhow::Result<()> {
         "note: fallback rate is an in-memory metric of a `serve` session — \
          not visible here across processes (v0 is single-client, with no multi-process coordination)"
     );
+    Ok(())
+}
+
+fn cmd_config_show(project: String) -> anyhow::Result<()> {
+    let root = resolve_project(&project)?;
+    match config::load(&root)? {
+        Some(cfg) => {
+            println!("embedding.provider = {}", cfg.embedding.provider);
+            println!("embedding.model = {}", cfg.embedding.model);
+            println!("embedding.dimension = {}", cfg.embedding.dimension);
+            if let Some(ctx) = cfg.embedding.context_size {
+                println!("embedding.context_size = {ctx}");
+            }
+            match &cfg.extraction {
+                Some(ext) => {
+                    println!("extraction.provider = {}", ext.provider);
+                    println!("extraction.model = {}", ext.model);
+                }
+                None => println!("extraction = not configured"),
+            }
+        }
+        None => println!(
+            "'{project}' has no .kern/config.toml yet — run `kern config set-embedding \
+             --project {project} --provider <ollama|llama_cpp_embedded> --model <name>`"
+        ),
+    }
+    Ok(())
+}
+
+/// Reconfiguring an existing project: the new provider's real dimension is
+/// checked against whatever's already indexed via the same
+/// `ensure_table`/`DimensionMismatch` path `cmd_serve` uses — switching to
+/// a differently-dimensioned model fails clearly here too, it does not
+/// silently corrupt the existing index.
+async fn cmd_config_set_embedding(
+    project: String,
+    provider: String,
+    model: String,
+) -> anyhow::Result<()> {
+    let root = resolve_project(&project)?;
+    let choice = parse_embedding_choice(&provider, model)?;
+    let embedding = setup::resolve_embedding_config(Some(choice)).await?;
+
+    let mut vectors = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
+    vectors.ensure_table(embedding.dimension).await?;
+
+    let mut cfg = config::load(&root)?.unwrap_or(config::ProjectConfig {
+        schema_version: 1,
+        embedding: embedding.clone(),
+        extraction: None,
+    });
+    cfg.embedding = embedding;
+    config::save(&root, &cfg)?;
+
+    println!("'{project}' embedding provider updated");
+    Ok(())
+}
+
+async fn cmd_config_set_extraction(
+    project: String,
+    provider: Option<String>,
+    model: Option<String>,
+) -> anyhow::Result<()> {
+    let root = resolve_project(&project)?;
+    let choice = match (provider, model) {
+        (Some(provider), Some(model)) => Some(parse_extraction_choice(&provider, model)?),
+        (None, None) => Some(setup::ExtractionChoice::Skip),
+        _ => anyhow::bail!(
+            "AGENT_SURFACE.INCOMPLETE_PROVIDER_FLAGS: pass both --provider and --model together, \
+             or neither to remove extraction"
+        ),
+    };
+    let extraction = setup::resolve_extraction_config(choice).await?;
+
+    let mut cfg = config::load(&root)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "AGENT_SURFACE.PROJECT_NOT_CONFIGURED: '{project}' has no embedding provider \
+             configured yet — run `kern config set-embedding` first"
+        )
+    })?;
+    cfg.extraction = extraction;
+    config::save(&root, &cfg)?;
+
+    println!("'{project}' extraction provider updated");
     Ok(())
 }
 
@@ -434,9 +649,46 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Project {
-            action: ProjectAction::Create { name, path },
-        } => cmd_project_create(name, path).await,
+            action:
+                ProjectAction::Create {
+                    name,
+                    path,
+                    embedding_provider,
+                    embedding_model,
+                    extraction_provider,
+                    extraction_model,
+                },
+        } => {
+            cmd_project_create(
+                name,
+                path,
+                embedding_provider,
+                embedding_model,
+                extraction_provider,
+                extraction_model,
+            )
+            .await
+        }
         Command::Serve { project } => cmd_serve(project).await,
         Command::Status { project } => cmd_status(project).await,
+        Command::Config {
+            action: ConfigAction::Show { project },
+        } => cmd_config_show(project),
+        Command::Config {
+            action:
+                ConfigAction::SetEmbedding {
+                    project,
+                    provider,
+                    model,
+                },
+        } => cmd_config_set_embedding(project, provider, model).await,
+        Command::Config {
+            action:
+                ConfigAction::SetExtraction {
+                    project,
+                    provider,
+                    model,
+                },
+        } => cmd_config_set_extraction(project, provider, model).await,
     }
 }

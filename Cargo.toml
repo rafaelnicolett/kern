@@ -29,6 +29,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+toml = "0.8"
 
 kern-ingest = { path = "kern-ingest" }
 kern-vector = { path = "kern-vector" }
