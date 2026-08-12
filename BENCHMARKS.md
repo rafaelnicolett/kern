@@ -122,6 +122,27 @@ once automatic download lands.
 
 ---
 
+## 4. Indexing concurrency
+
+Not a numbered benchmark section with its own measured table — the corpus
+used to validate this (a synthetic ~2MB fixture, generated on the fly, not
+part of this repo) isn't reproducible from what's checked in here, and this
+file's own bar is "every number measured, methodology reproducible next to
+it." What's real and worth stating plainly instead: `kern serve` indexes
+chunks concurrently, and both the client-side (`chunk_concurrency`) and
+backend-side (`OLLAMA_NUM_PARALLEL`) knobs that control how much of that
+concurrency is genuine (versus just a deeper queue in front of a backend
+still serving one request at a time) are documented, with how to change
+them and how to verify a change actually took effect, in the README's
+[Indexing throughput](README.md#indexing-throughput) section. That section
+also states a real, counter-intuitive finding from tuning this during
+development: raising the backend's parallelism past its sweet spot made
+indexing *slower*, not faster, on the hardware it was measured on — a
+reminder to measure a change on your own hardware rather than assume more
+concurrency is strictly better.
+
+---
+
 ## Comparison with other approaches
 
 No comparison against Semantica (or any other tool) is included here.

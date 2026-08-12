@@ -133,6 +133,68 @@ Whatever the source, chunk sizing itself adapts to the configured
 provider's reported context window — never a hardcoded assumption
 about how much text any given backend can accept in one call.
 
+### Indexing throughput
+
+`kern serve`'s catch-up scan embeds and enriches chunks concurrently, not
+one at a time — bounded by two separate knobs, one inside kern's own
+config, one on the model backend it's talking to. Both are real,
+measured levers, not guesses:
+
+- **`[indexing] chunk_concurrency`** in `.kern/config.toml` — how many
+  chunks kern has in flight at once during indexing. Defaults to `8`,
+  written explicitly into a new project's config file so it's visible and
+  hand-editable:
+
+  ```toml
+  [indexing]
+  chunk_concurrency = 8
+  ```
+
+  Change it by editing that number directly (no `kern config set-*`
+  subcommand for this one — it's a plain integer, not something that
+  needs a capability probe the way switching a model does) and re-running
+  `kern serve`. `kern config show --project <name>` prints the value
+  currently in effect.
+
+- **`OLLAMA_NUM_PARALLEL`** — outside kern entirely, this is Ollama's own
+  setting for how many requests its backing `llama-server` actually
+  processes in parallel per model. It defaults to a low value, and
+  raising `chunk_concurrency` above does **nothing** on its own if this is
+  still capping the backend to one request at a time underneath — kern's
+  concurrency only overlaps *waiting*, it can't make a serial backend
+  faster. Confirmed directly from the running process during development:
+  with the default, `llama-server` was launched with `-np 1`; setting the
+  env var and restarting Ollama changed that to `-np 4`.
+
+  To change it (macOS, Ollama installed as the menu-bar app):
+
+  ```bash
+  launchctl setenv OLLAMA_NUM_PARALLEL 4
+  killall Ollama    # fully quit — a respawned background service alone
+                     # keeps the OLD environment, has to be the app itself
+  open -a Ollama
+  ```
+
+  On Linux (`ollama serve` run directly, or via systemd), set the env var
+  before starting it instead — e.g. `OLLAMA_NUM_PARALLEL=4 ollama serve`,
+  or add `Environment="OLLAMA_NUM_PARALLEL=4"` to the systemd unit.
+  Verify the change actually took by checking the backing process's own
+  arguments (`ps aux | grep llama-server`) for `-np <N>` — `launchctl
+  setenv`/the env var alone doesn't confirm anything landed.
+
+  **More is not automatically better.** On the machine this was measured
+  on, going from `OLLAMA_NUM_PARALLEL=4` to `8` made real indexing
+  *slower*, not faster — `llama-server`'s own arguments showed it had
+  fallen back to `--no-mmap` under the extra memory pressure of 8 parallel
+  contexts. `4` was the measured sweet spot on that hardware; yours may
+  differ. Measure before committing to a value, the same way this project
+  did — don't just set it to a high number and assume it helped.
+
+  This setting is not currently exposed for the bundled `llama-server`
+  path (`llama_cpp_embedded`) — `LlamaCppRuntime::spawn` doesn't pass
+  `-np` today, so that backend runs effectively serial regardless of
+  `chunk_concurrency`. A known gap, not yet closed.
+
 ## Installing
 
 ### From a release (recommended)
