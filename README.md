@@ -82,20 +82,20 @@ kern needs a local model for embeddings (and, optionally, for ontology
 extraction/judging) — configured once per project, not guessed at
 `serve` time. `kern project create` resolves it as part of creation:
 
-- **Interactively** (a real terminal, no provider flags) — a guided setup
-  wizard detects what's actually available locally (a real `Ollama`
-  `/api/tags` probe, listing your actually-pulled models with their real
-  reported capabilities — never guessed from the model name — plus the
-  bundled engine if a `.gguf` is cached) and lets you pick.
+- **Interactively** (a terminal, no provider flags) — a guided setup
+  wizard detects what's available locally (an `Ollama` `/api/tags` probe,
+  listing your pulled models with their reported capabilities — never
+  guessed from the model name — plus the bundled engine if a `.gguf` is
+  cached) and lets you pick.
 - **Non-interactively** — pass `--embedding-provider <ollama|llama_cpp_embedded>
   --embedding-model <name>` (and optionally `--extraction-provider ollama
   --extraction-model <name>`) directly; required when stdin isn't a
   terminal, so scripted/CI usage never hangs waiting for input that can't
   arrive.
 
-Either way, kern proves the provider actually works — a real embedding
-call, dimension included — **before** persisting anything to
-`.kern/config.toml`. Two real local engines are supported today:
+Either way, kern proves the provider works — an embedding call, dimension
+included — **before** persisting anything to `.kern/config.toml`. Two
+local engines are supported today:
 
 - **Ollama** — `ollama pull all-minilm` for embeddings, and optionally
   `ollama pull llama3.2` for ontology extraction/judging.
@@ -104,7 +104,7 @@ call, dimension included — **before** persisting anything to
   extracted to `~/.cache/kern/bin/` on first use, no separate install. The
   embedding *weights* still have to come from somewhere:
   - the **[`kern-<target>-with-embedding-model`](#zero-setup-embeddings-no-ollama)
-    release tarball** ships a real embedding model
+    release tarball** ships an embedding model
     ([`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2),
     F16 GGUF, ~46 MB, Apache-2.0 — see
     [NOTICE-THIRD-PARTY](NOTICE-THIRD-PARTY)) as a file next to the binary,
@@ -123,14 +123,14 @@ a build-time bundling choice, not download-on-demand.
 Once configured, the choice is pinned — `kern serve` never silently swaps
 providers or falls back if the configured one becomes unreachable (a
 deliberate change from earlier v0 behavior), and switching a project's
-embedding model to a different real dimension requires an explicit
+embedding model to a different dimension requires an explicit
 re-index (`kern config set-embedding` fails clearly rather than corrupting
 the existing index). See `kern config show|set-embedding|set-extraction
 --project <name>` to inspect or change an existing project's
 configuration.
 
 Whatever the source, chunk sizing itself adapts to the configured
-provider's real, reported context window — never a hardcoded assumption
+provider's reported context window — never a hardcoded assumption
 about how much text any given backend can accept in one call.
 
 ## Installing
@@ -163,7 +163,7 @@ mv kern/kern /usr/local/bin/
 
 ### Zero-setup embeddings (no Ollama)
 
-`kern-<target>-with-embedding-model.tar.gz` bundles a real embedding model
+`kern-<target>-with-embedding-model.tar.gz` bundles an embedding model
 alongside the binary — no Ollama, no manual `.gguf` placement:
 
 ```bash
@@ -212,12 +212,12 @@ cargo build --release -p kern-cli
 ## Quick start
 
 `kern project create` resolves your model provider as part of creating the
-project — see [Model backend](#model-backend). Interactively, in a real
+project — see [Model backend](#model-backend). Interactively, in a
 terminal:
 
 ```bash
 # 1. Create a project — an isolated index + ontology over one folder.
-# With no --embedding-provider/--embedding-model flags and a real TTY,
+# With no --embedding-provider/--embedding-model flags and a TTY,
 # this launches a guided setup wizard.
 kern project create acme --path ./docs/acme
 
@@ -245,7 +245,7 @@ into. See below for wiring it up.
 about 2 minutes. For the **embedding** path, that's met today by the
 [`kern-<target>-with-embedding-model`](#zero-setup-embeddings-no-ollama)
 release tarball (see [BENCHMARKS.md](BENCHMARKS.md#3-time-to-useful-response)
-for a real measurement) — no manual `ollama pull` or `.gguf` placement
+for a measurement) — no manual `ollama pull` or `.gguf` placement
 needed, just picking it in the wizard (or passing
 `--embedding-provider llama_cpp_embedded --embedding-model <the .gguf
 file's name>`). **Ontology extraction/judging** still needs Ollama
@@ -292,12 +292,12 @@ for the full contract.
 
 ## Examples
 
-[`examples/`](examples) has a full, real, step-by-step tutorial — not
-just a corpus. [`examples/sample-specs/`](examples/sample-specs) is a
-15-file Spec-Driven Development project with **3 related features** and
-real cross-feature dependencies (a scheduled-reports feature that
-genuinely `depends_on` two other features' specs), plus free-form prose
-files with no frontmatter at all.
+[`examples/`](examples) has a full, step-by-step tutorial, not just a
+corpus. [`examples/sample-specs/`](examples/sample-specs) is a 15-file
+Spec-Driven Development project with **3 related features** and
+cross-feature dependencies (a scheduled-reports feature that
+`depends_on` two other features' specs), plus free-form prose files with
+no frontmatter at all.
 
 ```bash
 kern project create demo --path examples/sample-specs \
@@ -307,12 +307,12 @@ python3 examples/call_tool.py target/release/kern demo \
   query_by_concept '{"concept": "TASK-006"}'
 ```
 
-A real, unedited result from that corpus — two hops of `get_related_entities`
+An unedited result from that corpus — two hops of `get_related_entities`
 from one task surfaces its entire cross-feature dependency web, none of
 which is visible from reading that one task file alone:
 
 ```
-> get_related_entities({"entity_id": "<TASK-006's real id>", "depth": 2})
+> get_related_entities({"entity_id": "<TASK-006's id>", "depth": 2})
 
 {
   "subgraph": {
@@ -327,13 +327,13 @@ which is visible from reading that one task file alone:
 ```
 
 **[Read the full tutorial →](examples/README.md)** — every one of kern's 6
-MCP tools, with real transcripts, plus a real limitation this bigger
-corpus surfaced that a 5-file toy example didn't: `query_ontological`'s
-semantic routing gets less reliable once several files have
-structurally-similar content, and [`examples/skills/spec-context/`](examples/skills/spec-context)
-is a real, droppable Claude Code skill built specifically around that
-finding — using the more precise `query_by_concept` → `get_related_entities`
-flow instead of the router alone.
+MCP tools, with transcripts, plus a limitation this bigger corpus
+surfaced that a 5-file toy example didn't: `query_ontological`'s semantic
+routing gets less reliable once several files have structurally-similar
+content, and [`examples/skills/spec-context/`](examples/skills/spec-context)
+is a droppable Claude Code skill built around that finding — using the
+more precise `query_by_concept` → `get_related_entities` flow instead of
+the router alone.
 
 ## v0 scope
 
