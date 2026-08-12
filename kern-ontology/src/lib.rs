@@ -257,6 +257,35 @@ pub struct OntologyEngine {
     zone: AmbiguousZoneConfig,
     /// Fallback rate for judge() — North Star KPI.
     pub metrics: std::sync::Arc<FallbackMetrics>,
+    /// Embedding of each entity type's `description`, keyed by `type_id`.
+    /// `find_or_create_entity_type` is get-or-create — a type's description
+    /// never changes after creation — so once embedded, a type's vector is
+    /// valid for the lifetime of this engine. Without this cache,
+    /// `nearest_entity_type` re-embedded every existing type's description
+    /// on every single candidate, an O(candidates x types) blowup that
+    /// dominated real indexing time on any corpus large enough to
+    /// accumulate more than a handful of types.
+    type_embedding_cache: tokio::sync::RwLock<std::collections::HashMap<Uuid, Vec<f32>>>,
+    /// Embedding of a candidate's own probe text, keyed by
+    /// `trim().to_lowercase()` of that text. A real corpus mentions the
+    /// same term dozens of times — embedding is a deterministic function of
+    /// the text, so a repeat mention reuses the earlier vector instead of
+    /// paying another network round-trip. This does NOT change how a
+    /// repeat candidate is classified: only the embedding lookup is
+    /// skipped, the distance is still computed fresh against whatever
+    /// entity types currently exist.
+    candidate_embedding_cache: tokio::sync::RwLock<std::collections::HashMap<String, Vec<f32>>>,
+    /// In-memory mirror of `types.list_entity_types()`, invalidated (not
+    /// incrementally updated — simplicity over precision here) after any
+    /// call that can add or change an entity type. Avoids a SQLite table
+    /// scan on every single candidate — `nearest_entity_type` calls this
+    /// once per candidate.
+    entity_type_list_cache: tokio::sync::RwLock<Option<Vec<EntityTypeRecord>>>,
+    /// Same idea as `entity_type_list_cache`, for `types.list_relation_types()`
+    /// (read once per chunk in `process_chunk`, invalidated by
+    /// `evaluate_promotion` and any frontmatter-driven relation type
+    /// creation).
+    relation_type_list_cache: tokio::sync::RwLock<Option<Vec<RelationTypeRecord>>>,
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -289,7 +318,56 @@ impl OntologyEngine {
             embedder,
             zone,
             metrics: std::sync::Arc::new(FallbackMetrics::new()),
+            type_embedding_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            candidate_embedding_cache: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            entity_type_list_cache: tokio::sync::RwLock::new(None),
+            relation_type_list_cache: tokio::sync::RwLock::new(None),
         }
+    }
+
+    /// Cached counterpart to `types.list_entity_types()` — see
+    /// `entity_type_list_cache`.
+    async fn cached_entity_types(&self) -> Result<Vec<EntityTypeRecord>, OntologyError> {
+        if let Some(cached) = self.entity_type_list_cache.read().await.as_ref() {
+            return Ok(cached.clone());
+        }
+        let fresh = self.types.list_entity_types().await?;
+        *self.entity_type_list_cache.write().await = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    async fn invalidate_entity_type_list_cache(&self) {
+        *self.entity_type_list_cache.write().await = None;
+    }
+
+    /// Cached counterpart to `types.list_relation_types()` — see
+    /// `relation_type_list_cache`.
+    async fn cached_relation_types(&self) -> Result<Vec<RelationTypeRecord>, OntologyError> {
+        if let Some(cached) = self.relation_type_list_cache.read().await.as_ref() {
+            return Ok(cached.clone());
+        }
+        let fresh = self.types.list_relation_types().await?;
+        *self.relation_type_list_cache.write().await = Some(fresh.clone());
+        Ok(fresh)
+    }
+
+    async fn invalidate_relation_type_list_cache(&self) {
+        *self.relation_type_list_cache.write().await = None;
+    }
+
+    /// Cached counterpart to `embedder.embed()` for a candidate's own probe
+    /// text — see `candidate_embedding_cache`.
+    async fn candidate_text_embedding(&self, text: &str) -> Result<Vec<f32>, OntologyError> {
+        let key = text.trim().to_lowercase();
+        if let Some(cached) = self.candidate_embedding_cache.read().await.get(&key) {
+            return Ok(cached.clone());
+        }
+        let embedding = self.embedder.embed(text).await?;
+        self.candidate_embedding_cache
+            .write()
+            .await
+            .insert(key, embedding.clone());
+        Ok(embedding)
     }
 
     /// Real entry point of ingestion: extracts candidates from the chunk,
@@ -305,8 +383,7 @@ impl OntologyEngine {
     ) -> Result<Vec<ClassificationOutcome>, OntologyError> {
         let vocab = kern_model::RelationVocabulary {
             canonical_types: self
-                .types
-                .list_relation_types()
+                .cached_relation_types()
                 .await?
                 .into_iter()
                 .map(|t| t.name)
@@ -333,7 +410,7 @@ impl OntologyEngine {
         &self,
         candidate: &kern_model::CandidateEntity,
     ) -> Result<(f32, Option<EntityTypeRecord>), OntologyError> {
-        let entity_types = self.types.list_entity_types().await?;
+        let entity_types = self.cached_entity_types().await?;
         if entity_types.is_empty() {
             return Ok((1.0, None));
         }
@@ -342,11 +419,11 @@ impl OntologyEngine {
             .raw_type_hint
             .as_deref()
             .unwrap_or(&candidate.raw_name);
-        let candidate_embedding = self.embedder.embed(probe_text).await?;
+        let candidate_embedding = self.candidate_text_embedding(probe_text).await?;
 
         let mut best: Option<(EntityTypeRecord, f32)> = None;
         for entity_type in entity_types {
-            let desc_embedding = self.embedder.embed(&entity_type.description).await?;
+            let desc_embedding = self.type_description_embedding(&entity_type).await?;
             let distance = 1.0 - cosine_similarity(&candidate_embedding, &desc_embedding);
             if best.as_ref().map(|(_, d)| distance < *d).unwrap_or(true) {
                 best = Some((entity_type, distance));
@@ -354,6 +431,25 @@ impl OntologyEngine {
         }
         let (entity_type, distance) = best.expect("entity_types is not empty in this branch");
         Ok((distance, Some(entity_type)))
+    }
+
+    /// Cached embedding of `entity_type.description` — a type's description
+    /// is fixed at creation (`find_or_create_entity_type` is get-or-create),
+    /// so this only ever calls `embed()` once per distinct `type_id` for the
+    /// lifetime of this engine.
+    async fn type_description_embedding(
+        &self,
+        entity_type: &EntityTypeRecord,
+    ) -> Result<Vec<f32>, OntologyError> {
+        if let Some(cached) = self.type_embedding_cache.read().await.get(&entity_type.id) {
+            return Ok(cached.clone());
+        }
+        let embedding = self.embedder.embed(&entity_type.description).await?;
+        self.type_embedding_cache
+            .write()
+            .await
+            .insert(entity_type.id, embedding.clone());
+        Ok(embedding)
     }
 
     /// Decision logic:
@@ -454,6 +550,7 @@ impl OntologyEngine {
                 &format!("type inferred from '{}'", candidate.raw_name),
             )
             .await?;
+        self.invalidate_entity_type_list_cache().await;
         let entity = self
             .instances
             .find_or_create_entity(entity_type.id, &candidate.raw_name, file_path)
@@ -479,6 +576,7 @@ impl OntologyEngine {
             .types
             .register_candidate_type(relation_type_name, description)
             .await?;
+        self.invalidate_relation_type_list_cache().await;
         if record.status == RelationTypeStatus::Canonical {
             return Ok(record);
         }
@@ -489,6 +587,7 @@ impl OntologyEngine {
             .await?;
         if hits >= PROMOTION_THRESHOLD {
             self.types.promote_to_canonical(record.id).await?;
+            self.invalidate_relation_type_list_cache().await;
             return self
                 .types
                 .find_relation_type(relation_type_name)
@@ -613,6 +712,7 @@ impl OntologyEngine {
             .types
             .find_or_create_entity_type(&own_kind, &format!("frontmatter kind '{own_kind}'"))
             .await?;
+        self.invalidate_entity_type_list_cache().await;
 
         // If a forward reference from another file already created a
         // placeholder for this exact id, retype it in place instead of
@@ -658,12 +758,15 @@ impl OntologyEngine {
             let relation_type = match self.types.find_relation_type(concept).await? {
                 Some(rt) => rt,
                 None => {
-                    self.types
+                    let rt = self
+                        .types
                         .register_candidate_type(
                             concept,
                             &format!("frontmatter relation '{concept}'"),
                         )
-                        .await?
+                        .await?;
+                    self.invalidate_relation_type_list_cache().await;
+                    rt
                 }
             };
 
@@ -717,6 +820,7 @@ impl OntologyEngine {
                 "placeholder for an id referenced by frontmatter before its own file was ingested",
             )
             .await?;
+        self.invalidate_entity_type_list_cache().await;
         self.instances
             .find_or_create_entity(placeholder_type.id, canonical_name, referencing_file)
             .await
@@ -1317,5 +1421,292 @@ mod engine_tests {
             .unwrap();
 
         assert!(outcome.is_none());
+    }
+
+    /// Call-counting `EmbeddingProvider` — deliberately returns the same
+    /// vector for every input, so every candidate lands in the low-distance
+    /// merge branch (never the ambiguous zone) and the only thing this test
+    /// needs to assert is *how many times* `embed()` was called.
+    struct CountingEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl kern_model::EmbeddingProvider for CountingEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, kern_model::ModelError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![1.0, 0.0, 0.0])
+        }
+
+        async fn capabilities(
+            &self,
+        ) -> Result<kern_model::EmbeddingCapabilities, kern_model::ModelError> {
+            Ok(kern_model::EmbeddingCapabilities {
+                model_id: "fake".to_string(),
+                embedding_dim: 3,
+                max_input_tokens: None,
+            })
+        }
+    }
+
+    /// Returns one pre-set batch of candidates per call, in order — no
+    /// network involved. `judge`/`interpret_frontmatter_schema` panic if
+    /// called: with `CountingEmbedder` above, every candidate's distance to
+    /// every type is 0.0, always below the low-distance threshold, so this
+    /// test's path should never reach the ambiguous zone.
+    struct FixedExtraction {
+        rounds: std::sync::Mutex<std::collections::VecDeque<Vec<CandidateEntity>>>,
+    }
+
+    #[async_trait]
+    impl kern_model::ExtractionProvider for FixedExtraction {
+        fn model_id(&self) -> &str {
+            "fake"
+        }
+
+        async fn extract(
+            &self,
+            _chunk: &str,
+            _vocab: &kern_model::RelationVocabulary,
+        ) -> Result<Vec<CandidateEntity>, kern_model::ModelError> {
+            Ok(self.rounds.lock().unwrap().pop_front().unwrap_or_default())
+        }
+
+        async fn judge(
+            &self,
+            _candidate: &CandidateEntity,
+            _nearest_existing: &[kern_model::EntityType],
+        ) -> Result<kern_model::JudgeDecision, kern_model::ModelError> {
+            panic!("judge() should not be called — every candidate is forced into the low-distance merge branch")
+        }
+
+        async fn interpret_frontmatter_schema(
+            &self,
+            _keys: &[String],
+        ) -> Result<std::collections::HashMap<String, Option<String>>, kern_model::ModelError>
+        {
+            panic!("not exercised by this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn type_description_embeddings_are_cached_across_candidates_and_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("registry.db");
+        let types: Arc<dyn TypeRepository> =
+            Arc::new(SqliteTypeRepository::open(&db_path).unwrap());
+        let instances: Arc<dyn InstanceRepository> =
+            Arc::new(SqliteInstanceRepository::open(&db_path).unwrap());
+        let frontmatter_profiles: Arc<dyn FrontmatterProfileRepository> =
+            Arc::new(SqliteFrontmatterProfileRepository::open(&db_path).unwrap());
+
+        let embedder = Arc::new(CountingEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let extraction: Arc<dyn kern_model::ExtractionProvider> = Arc::new(FixedExtraction {
+            rounds: std::sync::Mutex::new(
+                vec![
+                    vec![
+                        CandidateEntity {
+                            raw_name: "alpha".to_string(),
+                            raw_type_hint: None,
+                        },
+                        CandidateEntity {
+                            raw_name: "beta".to_string(),
+                            raw_type_hint: None,
+                        },
+                    ],
+                    vec![
+                        CandidateEntity {
+                            raw_name: "gamma".to_string(),
+                            raw_type_hint: None,
+                        },
+                        CandidateEntity {
+                            raw_name: "delta".to_string(),
+                            raw_type_hint: None,
+                        },
+                        CandidateEntity {
+                            raw_name: "epsilon".to_string(),
+                            raw_type_hint: None,
+                        },
+                    ],
+                ]
+                .into(),
+            ),
+        });
+
+        let engine = OntologyEngine::new(
+            types.clone(),
+            instances,
+            extraction,
+            frontmatter_profiles,
+            embedder.clone(),
+            AmbiguousZoneConfig::default(),
+        );
+
+        // 4 pre-existing entity types — the first candidate that looks at
+        // each one has to embed its description; every candidate after that
+        // should reuse the cached vector instead of embedding it again.
+        for name in ["TypeA", "TypeB", "TypeC", "TypeD"] {
+            types
+                .find_or_create_entity_type(name, &format!("description of {name}"))
+                .await
+                .unwrap();
+        }
+
+        engine.process_chunk("chunk 1", "docs/a.md").await.unwrap(); // 2 candidates
+        engine.process_chunk("chunk 2", "docs/b.md").await.unwrap(); // 3 candidates
+
+        // Without the cache: 5 candidates x (4 type embeds + 1 candidate
+        // embed) = 25 embed() calls. With the cache: the 4 type
+        // descriptions are embedded once ever (4), plus 1 embed per
+        // candidate (5) = 9.
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            9,
+            "type description embeddings should be cached, not recomputed per candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_embeddings_are_cached_by_normalized_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("registry.db");
+        let types: Arc<dyn TypeRepository> =
+            Arc::new(SqliteTypeRepository::open(&db_path).unwrap());
+        let instances: Arc<dyn InstanceRepository> =
+            Arc::new(SqliteInstanceRepository::open(&db_path).unwrap());
+        let frontmatter_profiles: Arc<dyn FrontmatterProfileRepository> =
+            Arc::new(SqliteFrontmatterProfileRepository::open(&db_path).unwrap());
+
+        let embedder = Arc::new(CountingEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let extraction: Arc<dyn kern_model::ExtractionProvider> = Arc::new(FixedExtraction {
+            rounds: std::sync::Mutex::new(
+                vec![
+                    // Round 1: the exact same name twice in one chunk.
+                    vec![
+                        CandidateEntity {
+                            raw_name: "alpha".to_string(),
+                            raw_type_hint: None,
+                        },
+                        CandidateEntity {
+                            raw_name: "alpha".to_string(),
+                            raw_type_hint: None,
+                        },
+                    ],
+                    // Round 2: a different-case repeat of the same name,
+                    // plus one genuinely new name.
+                    vec![
+                        CandidateEntity {
+                            raw_name: "ALPHA".to_string(),
+                            raw_type_hint: None,
+                        },
+                        CandidateEntity {
+                            raw_name: "beta".to_string(),
+                            raw_type_hint: None,
+                        },
+                    ],
+                ]
+                .into(),
+            ),
+        });
+
+        let engine = OntologyEngine::new(
+            types.clone(),
+            instances,
+            extraction,
+            frontmatter_profiles,
+            embedder.clone(),
+            AmbiguousZoneConfig::default(),
+        );
+
+        for name in ["TypeA", "TypeB"] {
+            types
+                .find_or_create_entity_type(name, &format!("description of {name}"))
+                .await
+                .unwrap();
+        }
+
+        engine.process_chunk("chunk 1", "docs/a.md").await.unwrap();
+        engine.process_chunk("chunk 2", "docs/b.md").await.unwrap();
+
+        // Type descriptions: 2 types, embedded once ever = 2.
+        // Candidate embeds: "alpha" (round 1, first occurrence) = 1;
+        // second "alpha" in round 1 = cached, 0; "ALPHA" in round 2 =
+        // cached via normalized key, 0; "beta" in round 2 = 1.
+        // Total = 2 + 1 + 0 + 0 + 1 = 4.
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "repeat candidate text (including case variation) should reuse the cached embedding"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_type_list_cache_is_invalidated_when_a_new_type_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("registry.db");
+        let types: Arc<dyn TypeRepository> =
+            Arc::new(SqliteTypeRepository::open(&db_path).unwrap());
+        let instances: Arc<dyn InstanceRepository> =
+            Arc::new(SqliteInstanceRepository::open(&db_path).unwrap());
+        let frontmatter_profiles: Arc<dyn FrontmatterProfileRepository> =
+            Arc::new(SqliteFrontmatterProfileRepository::open(&db_path).unwrap());
+
+        let embedder = Arc::new(CountingEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let extraction: Arc<dyn kern_model::ExtractionProvider> = Arc::new(FixedExtraction {
+            rounds: std::sync::Mutex::new(
+                vec![
+                    // Round 1: no entity types exist yet — must create one.
+                    vec![CandidateEntity {
+                        raw_name: "widget".to_string(),
+                        raw_type_hint: None,
+                    }],
+                    // Round 2: the exact same name again — if the type list
+                    // cache weren't invalidated after round 1's creation,
+                    // this would incorrectly see an empty type list again
+                    // and create a SECOND "widget" type instead of merging.
+                    vec![CandidateEntity {
+                        raw_name: "widget".to_string(),
+                        raw_type_hint: None,
+                    }],
+                ]
+                .into(),
+            ),
+        });
+
+        let engine = OntologyEngine::new(
+            types.clone(),
+            instances,
+            extraction,
+            frontmatter_profiles,
+            embedder,
+            AmbiguousZoneConfig::default(),
+        );
+
+        let round1 = engine.process_chunk("chunk 1", "docs/a.md").await.unwrap();
+        assert!(
+            matches!(round1[0], ClassificationOutcome::NewType { .. }),
+            "no existing types — first occurrence must create a new type"
+        );
+
+        let round2 = engine.process_chunk("chunk 2", "docs/b.md").await.unwrap();
+        assert!(
+            matches!(round2[0], ClassificationOutcome::Merged { .. }),
+            "second occurrence should merge into the type created in round 1, \
+             not create a duplicate — got {:?}",
+            round2[0]
+        );
+
+        let entity_types = types.list_entity_types().await.unwrap();
+        assert_eq!(
+            entity_types.len(),
+            1,
+            "stale type list cache would have caused a duplicate 'widget' type"
+        );
     }
 }
