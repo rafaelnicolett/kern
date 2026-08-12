@@ -292,73 +292,48 @@ for the full contract.
 
 ## Examples
 
-[`examples/sample-specs/`](examples/sample-specs) is a small, real
-Spec-Driven Development corpus: a spec, a plan, and two tasks with
-frontmatter (`id`, `kind`, `status`, `depends_on`, `implements`), plus one
-free-form file with no frontmatter at all, to exercise the prose fallback
-path. Try it yourself:
+[`examples/`](examples) has a full, real, step-by-step tutorial — not
+just a corpus. [`examples/sample-specs/`](examples/sample-specs) is a
+15-file Spec-Driven Development project with **3 related features** and
+real cross-feature dependencies (a scheduled-reports feature that
+genuinely `depends_on` two other features' specs), plus free-form prose
+files with no frontmatter at all.
 
 ```bash
-kern project create demo --path examples/sample-specs
-python3 examples/query_ontological.py target/release/kern demo \
-  "what is the depends_on relation for TASK-002?"
+kern project create demo --path examples/sample-specs \
+  --embedding-provider ollama --embedding-model all-minilm \
+  --extraction-provider ollama --extraction-model llama3.2
+python3 examples/call_tool.py target/release/kern demo \
+  query_by_concept '{"concept": "TASK-006"}'
 ```
 
-The transcripts below are copied verbatim from that command against a real
-MCP session (`tools/call` over stdio, not simulated output) —
-[`examples/query_ontological.py`](examples/query_ontological.py) is the
-exact driver script, real and runnable, not a doc-only snippet. Ollama was
-running locally (`all-minilm` for embeddings, `llama3.2` for extraction and
-judging).
-
-**A question that routes by relation type** — `TASK-002`'s frontmatter
-(`depends_on: [TASK-001]`) was parsed deterministically into a real
-`depends_on` relation; `query_ontological` finds it via graph traversal,
-not vector search:
+A real, unedited result from that corpus — two hops of `get_related_entities`
+from one task surfaces its entire cross-feature dependency web, none of
+which is visible from reading that one task file alone:
 
 ```
-> query_ontological({"question": "what is the depends_on relation for TASK-002?"})
+> get_related_entities({"entity_id": "<TASK-006's real id>", "depth": 2})
 
 {
-  "mode": "graph_traversal",
-  "answer": "TASK-002 has 1 relation(s) of type 'depends_on'",
-  "evidence": [
-    {
-      "chunk_id": "af6d9596-0faa-4c42-a2be-6f5e8d4da481",
-      "excerpt": "see evidence chunk via search_hybrid"
-    }
-  ]
+  "subgraph": {
+    "entities": [
+      { "canonical_name": "TASK-004", ... }, { "canonical_name": "TASK-005", ... },
+      { "canonical_name": "PLAN-003", ... }, { "canonical_name": "PLAN-001", ... },
+      { "canonical_name": "PLAN-002", ... }, { "canonical_name": "SPEC-003", ... },
+      { "canonical_name": "TASK-001", ... }
+    ]
+  }
 }
 ```
 
-**A question with no relation-type match** — falls back to `search_hybrid`
-over the free-form `design-notes.md` file, which has no frontmatter and
-went through prose extraction instead:
-
-```
-> query_ontological({"question": "how does the export handle large row counts?"})
-
-{
-  "mode": "vector_fallback",
-  "answer": "# Design notes: CSV export\n\nThis file has no frontmatter on purpose — it's the free-form counterpart to\nthe specs/plan/tasks in `.specify/specs/`, meant to exercise kern's prose\nfallback path rather than the deterministic frontmatter path.\n\nRow streaming for the export endpoint is implemented with a cursor-based\ndatabase query rather than `OFFSET`/`LIMIT` paging, since offset pagination\ndegrades badly past a few hundred thousand rows — exactly the range\nSPEC-001 asks this to handle. The dashboard's CSV button reuses the same\nfilter-serialization helper the dashboard's own data-fetching code already\nuses, so the exported rows always match what's on screen.\n",
-  "evidence": [
-    { "chunk_id": "79897d41-...", "excerpt": "# Design notes: CSV export\n\n..." },
-    { "chunk_id": "3130dd70-...", "excerpt": "## Requirements\n\n- A logged-in user can export..." },
-    { "chunk_id": "64bd4542-...", "excerpt": "# Implementation plan: CSV export\n\n..." }
-  ]
-}
-```
-
-**Getting a `graph_traversal` result reliably depends on how the question
-is phrased**, and this is worth being honest about: `query_ontological`'s
-semantic router embeds the question and compares it against each relation
-type's (fairly generic, seeded) description — a question that echoes the
-relation's name closely (`depends_on`) scores well above the routing
-threshold; a more naturally-phrased one ("what does TASK-002 *depend on*?")
-scored well under it in testing. This is a real, current limitation of the
-v0 router, not fabricated behavior — improving it (richer canonical
-descriptions, a better routing signal than raw cosine similarity over a
-short template string) is open work.
+**[Read the full tutorial →](examples/README.md)** — every one of kern's 6
+MCP tools, with real transcripts, plus a real limitation this bigger
+corpus surfaced that a 5-file toy example didn't: `query_ontological`'s
+semantic routing gets less reliable once several files have
+structurally-similar content, and [`examples/skills/spec-context/`](examples/skills/spec-context)
+is a real, droppable Claude Code skill built specifically around that
+finding — using the more precise `query_by_concept` → `get_related_entities`
+flow instead of the router alone.
 
 ## v0 scope
 

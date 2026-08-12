@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 
 
 def main() -> None:
@@ -30,6 +31,23 @@ def main() -> None:
         text=True,
         bufsize=1,
     )
+
+    # kern's own tracing output goes to stderr and can run to hundreds of
+    # lines during a real catch-up scan (frontmatter + prose extraction is
+    # one real LLM call per candidate) — on a large enough corpus that
+    # exceeds the OS pipe buffer (~64KB), and with nothing draining
+    # `stderr=subprocess.PIPE`, the child blocks trying to write more of
+    # it while this script blocks reading stdout that will never arrive.
+    # A background thread that continuously drains stderr avoids that
+    # deadlock; the last N lines are kept only for the failure path below.
+    stderr_tail: list[str] = []
+
+    def drain_stderr() -> None:
+        for line in proc.stderr:
+            stderr_tail.append(line)
+            del stderr_tail[:-200]
+
+    threading.Thread(target=drain_stderr, daemon=True).start()
 
     def send(message: dict) -> None:
         proc.stdin.write(json.dumps(message) + "\n")
@@ -67,8 +85,8 @@ def main() -> None:
         proc.kill()
 
     if response is None:
-        print("no response — server exited early; stderr:", file=sys.stderr)
-        print(proc.stderr.read(), file=sys.stderr)
+        print("no response — server exited early; last stderr lines:", file=sys.stderr)
+        print("".join(stderr_tail), file=sys.stderr)
         sys.exit(1)
 
     result = json.loads(response["result"]["content"][0]["text"])
