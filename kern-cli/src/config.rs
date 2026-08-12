@@ -16,6 +16,46 @@ pub struct ProjectConfig {
     pub embedding: EmbeddingConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extraction: Option<ExtractionConfig>,
+    /// `#[serde(default)]` so a project configured before this field
+    /// existed loads fine and just gets the default — a missing
+    /// `[indexing]` section is not the kind of ambiguity that deserves a
+    /// hard error the way a missing embedding provider does, this is a
+    /// pure performance knob with a safe default.
+    #[serde(default)]
+    pub indexing: IndexingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexingConfig {
+    /// How many chunks `catch_up_scan` embeds/enriches concurrently.
+    /// Bounded by what the configured model backend can actually sustain
+    /// in parallel, not by kern itself — see the README's "Indexing
+    /// throughput" section before raising this. Real local backends
+    /// process the requests they can and queue the rest, so this is a
+    /// "how many in flight at once" knob, not a hard guarantee of that
+    /// much real parallelism.
+    #[serde(default = "default_chunk_concurrency")]
+    pub chunk_concurrency: usize,
+}
+
+/// Deliberately higher than the model backend's own real concurrency
+/// ceiling (Ollama defaults to `OLLAMA_NUM_PARALLEL=4` real parallel
+/// slots) — a client-side queue a bit deeper than the server can execute
+/// at once keeps all of the server's slots busy instead of idling between
+/// requests. This is NOT the knob that controls real backend parallelism;
+/// see the README's "Indexing throughput" section for that one
+/// (`OLLAMA_NUM_PARALLEL`, external to kern). Raising this without also
+/// raising the backend's own concurrency mostly just deepens the queue.
+fn default_chunk_concurrency() -> usize {
+    8
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self {
+            chunk_concurrency: default_chunk_concurrency(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +131,9 @@ mod tests {
                 provider: "ollama".to_string(),
                 model: "llama3.2".to_string(),
             }),
+            indexing: IndexingConfig {
+                chunk_concurrency: 8,
+            },
         };
 
         save(dir.path(), &config).unwrap();
@@ -101,6 +144,28 @@ mod tests {
         assert_eq!(loaded.embedding.model, "all-minilm");
         assert_eq!(loaded.embedding.dimension, 384);
         assert_eq!(loaded.extraction.unwrap().model, "llama3.2");
+        assert_eq!(loaded.indexing.chunk_concurrency, 8);
+    }
+
+    #[test]
+    fn indexing_defaults_when_the_config_file_predates_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A config.toml written before `[indexing]` existed — no such
+        // section at all.
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n[embedding]\nprovider = \"ollama\"\nmodel = \"all-minilm\"\ndimension = 384\n",
+        )
+        .unwrap();
+
+        let loaded = load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.indexing.chunk_concurrency,
+            default_chunk_concurrency(),
+            "a pre-existing config without [indexing] should default, not fail to load"
+        );
     }
 
     #[test]
@@ -115,6 +180,7 @@ mod tests {
                 context_size: Some(512),
             },
             extraction: None,
+            indexing: IndexingConfig::default(),
         };
         save(dir.path(), &config).unwrap();
 

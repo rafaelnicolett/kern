@@ -30,6 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 toml = "0.8"
+futures = "0.3"
 
 kern-ingest = { path = "kern-ingest" }
 kern-vector = { path = "kern-vector" }

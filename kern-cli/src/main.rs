@@ -20,6 +20,8 @@ use kern_ontology::{
 use kern_vector::{ChunkRecord, LanceVectorStore, VectorStore};
 use tracing_subscriber::EnvFilter;
 
+use futures::stream::{self, TryStreamExt};
+
 mod config;
 mod embedded;
 mod setup;
@@ -218,6 +220,7 @@ async fn cmd_project_create(
             schema_version: 1,
             embedding,
             extraction,
+            indexing: config::IndexingConfig::default(),
         },
     )?;
 
@@ -285,15 +288,37 @@ fn resolve_project(name: &str) -> anyhow::Result<PathBuf> {
 /// `chunker` is budget-aware, sourced from the active embedding provider's
 /// real `capabilities()` at the call site — never a hardcoded assumption
 /// about how much any given backend can accept in one call.
+/// One chunk queued for the concurrent phase of `catch_up_scan`, after
+/// frontmatter ingestion (Phase 1, serial) has already run for its file.
+struct PendingChunk {
+    chunk: kern_ingest::Chunk,
+    file_path: String,
+    is_frontmatter_chunk: bool,
+}
+
 async fn catch_up_scan(
     root: &Path,
     vector_store: &dyn VectorStore,
     embedder: &dyn EmbeddingProvider,
     ontology_engine: Option<&OntologyEngine>,
     chunker: &dyn MarkdownChunker,
+    // How many chunks are embedded/enriched concurrently — from
+    // `.kern/config.toml`'s `[indexing] chunk_concurrency`
+    // (`config::IndexingConfig`), not a hardcoded constant, so a user can
+    // tune it for their own hardware/backend without a code change. See
+    // the README's "Indexing throughput" section.
+    chunk_concurrency: usize,
 ) -> anyhow::Result<usize> {
-    let mut indexed = 0usize;
-
+    // Phase 1 — serial, cheap: read + chunk each file and run frontmatter
+    // ingestion (deterministic parse, plus at most one LLM call ever per
+    // new key-shape, cached thereafter) in sorted file order. Kept serial
+    // on purpose: `walk_markdown_files` sorts specifically so a numbered
+    // corpus resolves forward references (`depends_on: [X]` before X is
+    // ingested) with fewer transient placeholders — a quality property,
+    // not a correctness requirement (placeholders always resolve correctly
+    // via retype, in any order). This phase is SQLite + a rarely-hit LLM
+    // call, never the bottleneck the concurrency below targets.
+    let mut pending = Vec::new();
     for entry in walk_markdown_files(root)? {
         let content = std::fs::read_to_string(&entry)?;
         let chunks = chunker.chunk(&entry, &content);
@@ -320,36 +345,63 @@ async fn catch_up_scan(
         }
 
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let embedding = embedder.embed(&chunk.content).await?;
             let file_path = chunk.file_path.to_string_lossy().to_string();
-
-            let is_frontmatter_chunk = i == 0 && skip_prose_on_first_chunk;
-            if !is_frontmatter_chunk {
-                if let Some(engine) = ontology_engine {
-                    if let Err(e) = engine.process_chunk(&chunk.content, &file_path).await {
-                        tracing::warn!(
-                            error = %e,
-                            file = %file_path,
-                            "failed to enrich ontology for this chunk — vector indexing is not affected"
-                        );
-                    }
-                }
-            }
-
-            vector_store
-                .upsert(ChunkRecord {
-                    id: chunk.id,
-                    file_path,
-                    content: chunk.content,
-                    embedding,
-                    content_hash: chunk.content_hash,
-                    updated_at: now_timestamp(),
-                })
-                .await?;
-            indexed += 1;
+            pending.push(PendingChunk {
+                chunk,
+                file_path,
+                is_frontmatter_chunk: i == 0 && skip_prose_on_first_chunk,
+            });
         }
     }
-    Ok(indexed)
+
+    // Phase 2 — concurrent, expensive: embedding and ontology enrichment
+    // are network round-trips to the model backend — the real cost of
+    // indexing. `try_for_each_concurrent` overlaps up to `chunk_concurrency`
+    // of them at once instead of paying each one's latency back to back,
+    // and still fails fast (stops launching new work, propagates the
+    // error) on the first embed/upsert failure, matching the original
+    // serial loop's behavior. A `process_chunk` (ontology) failure is
+    // still logged and skipped, not fatal — vector indexing for that chunk
+    // still completes.
+    let indexed = std::sync::atomic::AtomicUsize::new(0);
+    stream::iter(pending.into_iter().map(Ok::<_, anyhow::Error>))
+        .try_for_each_concurrent(Some(chunk_concurrency), |item| {
+            let indexed = &indexed;
+            async move {
+                let embedding = embedder.embed(&item.chunk.content).await?;
+
+                if !item.is_frontmatter_chunk {
+                    if let Some(engine) = ontology_engine {
+                        if let Err(e) = engine
+                            .process_chunk(&item.chunk.content, &item.file_path)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                file = %item.file_path,
+                                "failed to enrich ontology for this chunk — vector indexing is not affected"
+                            );
+                        }
+                    }
+                }
+
+                vector_store
+                    .upsert(ChunkRecord {
+                        id: item.chunk.id,
+                        file_path: item.file_path,
+                        content: item.chunk.content,
+                        embedding,
+                        content_hash: item.chunk.content_hash,
+                        updated_at: now_timestamp(),
+                    })
+                    .await?;
+                indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        })
+        .await?;
+
+    Ok(indexed.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn now_timestamp() -> String {
@@ -462,6 +514,7 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
         embedder.as_ref(),
         ontology_engine.as_ref(),
         &chunker,
+        project_config.indexing.chunk_concurrency,
     )
     .await?;
     tracing::info!(chunks_indexed = indexed, "catch-up complete");
@@ -570,6 +623,11 @@ fn cmd_config_show(project: String) -> anyhow::Result<()> {
                 }
                 None => println!("extraction = not configured"),
             }
+            println!(
+                "indexing.chunk_concurrency = {} (edit .kern/config.toml to change — see \
+                 README's \"Indexing throughput\" section)",
+                cfg.indexing.chunk_concurrency
+            );
         }
         None => println!(
             "'{project}' has no .kern/config.toml yet — run `kern config set-embedding \
@@ -600,6 +658,7 @@ async fn cmd_config_set_embedding(
         schema_version: 1,
         embedding: embedding.clone(),
         extraction: None,
+        indexing: config::IndexingConfig::default(),
     });
     cfg.embedding = embedding;
     config::save(&root, &cfg)?;

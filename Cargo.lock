@@ -2770,6 +2770,7 @@ dependencies = [
  "clap",
  "dirs 5.0.1",
  "flate2",
+ "futures",
  "kern-ingest",
  "kern-mcp",
  "kern-model",
