@@ -254,16 +254,16 @@ async fn oversized_protected_table_is_classified_as_request_rejected_not_backend
     // A real-shaped offender: a status-code reference table with an
     // embedded code sample per row, like the real page that surfaced
     // this bug — not an adversarially malformed fixture.
-    let mut table = String::from(
-        "| Status | Meaning | Example handler |\n|---|---|---|\n",
-    );
+    let mut table = String::from("| Status | Meaning | Example handler |\n|---|---|---|\n");
     for i in 200..260 {
         table.push_str(&format!(
             "| {i} | HTTP status {i} | `public ResponseEntity<Object> handle{i}(Exception e) {{ \
              return ResponseEntity.status({i}).body(new ErrorPayload(e.getMessage())); }}` |\n"
         ));
     }
-    let markdown = format!("# API Response Codes\n\n{table}\n\n# Short Section\n\nJust a short paragraph here.\n");
+    let markdown = format!(
+        "# API Response Codes\n\n{table}\n\n# Short Section\n\nJust a short paragraph here.\n"
+    );
 
     let chunker = BudgetAwareMarkdownChunker::new(
         StructuralMarkdownChunker,
