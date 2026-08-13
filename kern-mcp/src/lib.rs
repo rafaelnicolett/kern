@@ -402,13 +402,27 @@ impl KernServer {
         // prefer the match from the LONGEST cleaned word — a longer token
         // is far less likely to be an accidental substring hit and far
         // more likely to be an actual identifier the question is about.
+        //
+        // Second real bug found empirically, on a larger corpus: "longest
+        // word wins" is still wrong when a prose-extracted entity happens
+        // to collide with an ordinary word that's simply longer than the
+        // real identifier — e.g. a corpus with an (erroneously extracted)
+        // entity literally named "depends_on" made every question shaped
+        // like "what is the depends_on relation for TASK-010b?" resolve
+        // to "depends_on" instead of "TASK-010b", because "depends_on" (10
+        // chars) out-lengths "TASK-010b" (9). An EXACT canonical-name
+        // match is a categorically stronger signal than any substring hit
+        // regardless of length, and now short-circuits the search — a
+        // substring match only gets considered when no word in the
+        // question exactly names a known entity.
         const STOPWORDS: &[&str] = &[
             "the", "for", "and", "are", "was", "were", "has", "have", "had", "not", "but", "you",
             "your", "with", "this", "that", "from", "what", "how", "does", "did", "who", "when",
             "where", "which",
         ];
         let mentioned_entity = {
-            let mut best_match: Option<(usize, kern_ontology::EntityRecord)> = None;
+            let mut exact_match: Option<kern_ontology::EntityRecord> = None;
+            let mut best_substring: Option<(usize, kern_ontology::EntityRecord)> = None;
             for word in question.split_whitespace() {
                 let cleaned: String = word
                     .chars()
@@ -417,20 +431,26 @@ impl KernServer {
                 if cleaned.len() < 3 || STOPWORDS.contains(&cleaned.to_lowercase().as_str()) {
                     continue;
                 }
-                if let Ok(mut matches) = self.instances.find_entities_by_name(&cleaned).await {
-                    if !matches.is_empty() {
-                        let candidate = matches.remove(0);
-                        let is_longer = best_match
+                if let Ok(matches) = self.instances.find_entities_by_name(&cleaned).await {
+                    if let Some(exact) = matches
+                        .iter()
+                        .find(|e| e.canonical_name.eq_ignore_ascii_case(&cleaned))
+                    {
+                        exact_match = Some(exact.clone());
+                        break;
+                    }
+                    if let Some(candidate) = matches.into_iter().next() {
+                        let is_longer = best_substring
                             .as_ref()
                             .map(|(len, _)| cleaned.len() > *len)
                             .unwrap_or(true);
                         if is_longer {
-                            best_match = Some((cleaned.len(), candidate));
+                            best_substring = Some((cleaned.len(), candidate));
                         }
                     }
                 }
             }
-            best_match.map(|(_, entity)| entity)
+            exact_match.or_else(|| best_substring.map(|(_, entity)| entity))
         };
 
         if let (Some((relation_type, score)), Some(entity)) = (&best, &mentioned_entity) {
@@ -868,6 +888,93 @@ mod tests {
         assert_eq!(
             output.mode, "graph_traversal",
             "the stopword 'for' should never win over the real entity 'TASK-002' mentioned later"
+        );
+    }
+
+    /// Real bug found empirically against a 66-file dogfood corpus: a
+    /// noisy prose-extracted entity whose name merely *contained*
+    /// "depends_on" as a substring (not an exact match) out-lengthed the
+    /// real target identifier's matched word under the old "longest word
+    /// wins" rule, so the router picked the noise entity over the real
+    /// one. An exact canonical-name match must win over any substring
+    /// match regardless of which word in the question is longer or comes
+    /// first.
+    ///
+    /// (The specific real-world case this was found from was actually an
+    /// *exact*-name collision — a prose-extracted entity literally named
+    /// "depends_on" — which this router-level fix alone cannot
+    /// disambiguate from a genuine exact match on that same word; see
+    /// `kern-ontology`'s
+    /// `candidate_colliding_with_a_reserved_relation_type_name_is_rejected`
+    /// for the fix that stops that entity from being created in the
+    /// first place. This test covers the distinct substring-collision
+    /// case this router-level change *can* fix on its own.)
+    #[tokio::test]
+    async fn query_ontological_prefers_an_exact_match_over_a_longer_substring_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (srv, _) = server(dir.path()).await;
+
+        if !OllamaClient::new("all-minilm").probe().await {
+            eprintln!("Ollama is not running on :11434 — skipping integration test");
+            return;
+        }
+
+        srv.types.seed_canonical_vocabulary().await.unwrap();
+        let depends_on = srv
+            .types
+            .find_relation_type("depends_on")
+            .await
+            .unwrap()
+            .unwrap();
+        let entity_type = srv
+            .types
+            .find_or_create_entity_type("Task", "a task")
+            .await
+            .unwrap();
+
+        // The distractor: an entity whose name *contains* "depends_on" as
+        // a substring (not an exact match) — its matched word ("depends_on",
+        // 10 chars) is longer than "TASK-010b" (9 chars), so the old
+        // "longest word wins" heuristic picked this substring hit over
+        // the real, exact-matching entity.
+        srv.instances
+            .find_or_create_entity(entity_type.id, "depends_on_field_mapping_notes", "noise.md")
+            .await
+            .unwrap();
+
+        let task_b = srv
+            .instances
+            .find_or_create_entity(entity_type.id, "TASK-010b", "a.md")
+            .await
+            .unwrap();
+        let task_a = srv
+            .instances
+            .find_or_create_entity(entity_type.id, "TASK-010a", "b.md")
+            .await
+            .unwrap();
+        srv.instances
+            .record_relation(kern_ontology::RelationRecord {
+                id: Uuid::new_v4(),
+                type_id: depends_on.id,
+                source_entity_id: task_b.id,
+                target_entity_id: task_a.id,
+                confidence: 1.0,
+                evidence_chunk_id: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+
+        let Json(output) = srv
+            .query_ontological(Parameters(QueryOntologicalInput {
+                question: "what is the depends_on relation for TASK-010b?".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.mode, "graph_traversal",
+            "an exact match on TASK-010b must win over the longer substring collision \
+             with the distractor entity 'depends_on_field_mapping_notes'"
         );
     }
 

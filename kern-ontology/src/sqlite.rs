@@ -68,7 +68,8 @@ fn ensure_schema(conn: &Connection) -> Result<(), OntologyError> {
             source_entity_id TEXT NOT NULL,
             target_entity_id TEXT NOT NULL,
             confidence REAL NOT NULL,
-            evidence_chunk_id TEXT NOT NULL
+            evidence_chunk_id TEXT NOT NULL,
+            UNIQUE (type_id, source_entity_id, target_entity_id)
         );",
     )?;
     Ok(())
@@ -426,12 +427,23 @@ impl InstanceRepository for SqliteInstanceRepository {
         .await?
     }
 
+    /// Get-or-create by `(type_id, source_entity_id, target_entity_id)` —
+    /// real bug found empirically: `kern serve` reprocesses the whole
+    /// corpus from scratch on every invocation (no incremental cache
+    /// yet), and a plain unconditional `INSERT` here meant every restart
+    /// against an already-populated project duplicated every single
+    /// frontmatter-derived relation — not just wasted work, a real
+    /// correctness bug: `direct_relations`/`query_ontological`'s reported
+    /// relation counts grew without bound across ordinary restarts.
+    /// `INSERT OR IGNORE` against the table's `UNIQUE` constraint mirrors
+    /// the same idiom `SqliteTypeRepository::find_or_create_entity_type`
+    /// already uses.
     async fn record_relation(&self, relation: RelationRecord) -> Result<(), OntologyError> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO relations (id, type_id, source_entity_id, target_entity_id, confidence, evidence_chunk_id)
+                "INSERT OR IGNORE INTO relations (id, type_id, source_entity_id, target_entity_id, confidence, evidence_chunk_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     relation.id.to_string(),
@@ -978,6 +990,62 @@ mod tests {
         let depth2 = repo.related_entities(a.id, 2).await.unwrap();
         assert_eq!(depth2.len(), 2, "depth 2 should reach c via b");
         assert!(depth2.iter().any(|e| e.id == c.id));
+    }
+
+    /// Real bug found empirically on a dogfood corpus: `kern serve`
+    /// reprocesses the whole corpus on every restart (no incremental
+    /// cache), and every restart against an already-populated project
+    /// used to record the exact same frontmatter-derived relation again
+    /// — with a fresh `id` and `evidence_chunk_id` each time, so nothing
+    /// deduplicated it. This simulates two "indexing passes" recording
+    /// the same logical relation and asserts only one row survives.
+    #[tokio::test]
+    async fn record_relation_is_idempotent_across_repeated_indexing_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqliteInstanceRepository::open(&dir.path().join("registry.db")).unwrap();
+        let type_id = Uuid::new_v4();
+
+        let source = repo
+            .find_or_create_entity(type_id, "TASK-010b", "a.md")
+            .await
+            .unwrap();
+        let target = repo
+            .find_or_create_entity(type_id, "TASK-010a", "a.md")
+            .await
+            .unwrap();
+
+        // First "indexing pass".
+        repo.record_relation(RelationRecord {
+            id: Uuid::new_v4(),
+            type_id,
+            source_entity_id: source.id,
+            target_entity_id: target.id,
+            confidence: 1.0,
+            evidence_chunk_id: Uuid::new_v4(),
+        })
+        .await
+        .unwrap();
+
+        // Second "indexing pass" — same logical relation, fresh id and
+        // evidence_chunk_id, exactly like a second `kern serve` restart
+        // reprocessing the same file would produce.
+        repo.record_relation(RelationRecord {
+            id: Uuid::new_v4(),
+            type_id,
+            source_entity_id: source.id,
+            target_entity_id: target.id,
+            confidence: 1.0,
+            evidence_chunk_id: Uuid::new_v4(),
+        })
+        .await
+        .unwrap();
+
+        let relations = repo.direct_relations(source.id).await.unwrap();
+        assert_eq!(
+            relations.len(),
+            1,
+            "the same (type, source, target) relation recorded twice should not duplicate"
+        );
     }
 
     #[tokio::test]

@@ -381,18 +381,44 @@ impl OntologyEngine {
         chunk_content: &str,
         file_path: &str,
     ) -> Result<Vec<ClassificationOutcome>, OntologyError> {
+        let relation_type_names: Vec<String> = self
+            .cached_relation_types()
+            .await?
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         let vocab = kern_model::RelationVocabulary {
-            canonical_types: self
-                .cached_relation_types()
-                .await?
-                .into_iter()
-                .map(|t| t.name)
-                .collect(),
+            canonical_types: relation_type_names.clone(),
         };
         let candidates = self.extraction.extract(chunk_content, &vocab).await?;
 
         let mut outcomes = Vec::with_capacity(candidates.len());
         for candidate in candidates {
+            // Real bug found empirically: the model sometimes extracts a
+            // relation-type's own *field name* (e.g. "depends_on") as if
+            // it were a domain entity — usually from prose that discusses
+            // the frontmatter mechanism itself, not the domain it
+            // describes. Reject outright rather than merge/create-type: a
+            // candidate literally named after reserved vocabulary is
+            // almost certainly this, not a real entity, and letting it
+            // into the entity table poisons query_ontological's
+            // entity-mention matching for every future question that
+            // happens to use the same word (see kern-mcp's
+            // `query_ontological_prefers_an_exact_match_over_a_longer_substring_collision`
+            // regression test for the exact failure this caused).
+            if relation_type_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&candidate.raw_name))
+            {
+                outcomes.push(ClassificationOutcome::Rejected {
+                    reason: format!(
+                        "candidate '{}' collides with a reserved relation-type name — likely \
+                         the model extracted the field name itself rather than a domain entity",
+                        candidate.raw_name
+                    ),
+                });
+                continue;
+            }
             let (distance, nearest) = self.nearest_entity_type(&candidate).await?;
             let outcome = self
                 .process_candidate(candidate, distance, nearest.as_ref(), file_path)
@@ -1707,6 +1733,88 @@ mod engine_tests {
             entity_types.len(),
             1,
             "stale type list cache would have caused a duplicate 'widget' type"
+        );
+    }
+
+    /// Real bug found empirically: the model sometimes extracts a
+    /// relation-type's own field name (e.g. "depends_on") as a candidate
+    /// entity, which later poisons `query_ontological`'s entity-mention
+    /// matching (see kern-mcp's regression test for the exact failure
+    /// this caused on a real corpus). A candidate whose name collides
+    /// with a reserved relation-type name must be rejected before it
+    /// ever reaches the entity table — and, as a side effect, before it
+    /// costs an embed() call at all.
+    #[tokio::test]
+    async fn candidate_colliding_with_a_reserved_relation_type_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("registry.db");
+        let types: Arc<dyn TypeRepository> =
+            Arc::new(SqliteTypeRepository::open(&db_path).unwrap());
+        types.seed_canonical_vocabulary().await.unwrap();
+        let instances: Arc<dyn InstanceRepository> =
+            Arc::new(SqliteInstanceRepository::open(&db_path).unwrap());
+        let frontmatter_profiles: Arc<dyn FrontmatterProfileRepository> =
+            Arc::new(SqliteFrontmatterProfileRepository::open(&db_path).unwrap());
+
+        let embedder = Arc::new(CountingEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let extraction: Arc<dyn kern_model::ExtractionProvider> = Arc::new(FixedExtraction {
+            rounds: std::sync::Mutex::new(
+                vec![vec![
+                    // Same casing quirk seen in the real failure — the
+                    // model extracted it lowercase with an underscore,
+                    // matching the seeded relation type name exactly.
+                    CandidateEntity {
+                        raw_name: "depends_on".to_string(),
+                        raw_type_hint: None,
+                    },
+                    CandidateEntity {
+                        raw_name: "TASK-010b".to_string(),
+                        raw_type_hint: None,
+                    },
+                ]]
+                .into(),
+            ),
+        });
+
+        let engine = OntologyEngine::new(
+            types,
+            instances,
+            extraction,
+            frontmatter_profiles,
+            embedder.clone(),
+            AmbiguousZoneConfig::default(),
+        );
+
+        let outcomes = engine
+            .process_chunk("chunk mentioning depends_on and TASK-010b", "docs/a.md")
+            .await
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            matches!(outcomes[0], ClassificationOutcome::Rejected { .. }),
+            "'depends_on' should be rejected as reserved vocabulary, got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(outcomes[1], ClassificationOutcome::NewType { .. }),
+            "'TASK-010b' is a real candidate and should still be classified normally, got {:?}",
+            outcomes[1]
+        );
+
+        // The rejected candidate never reached embed() at all. TASK-010b
+        // also costs zero embed calls here, but for an unrelated reason:
+        // with no entity types created yet, `nearest_entity_type` returns
+        // early before embedding anything (see
+        // `process_chunk_with_no_existing_types_creates_new_type`'s real
+        // counterpart) — asserting 0 total confirms the rejected
+        // candidate specifically added no embed cost of its own.
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the reserved-vocabulary rejection should short-circuit before any embed() call"
         );
     }
 }
