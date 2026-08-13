@@ -1,10 +1,11 @@
 # Benchmarks
 
-> **Status**: early, small-corpus numbers from the one real example corpus
-> in this repo — not a claim about behavior at scale. Every number here was
-> measured, not estimated; the methodology to reproduce each one is next to
-> it. If a number looks too good (or too small) to be meaningful, that's
-> usually because the corpus is small — see the caveat on each section.
+> **Status**: early, small-corpus numbers from the two example corpora in
+> this repo (`examples/sample-specs/`, `dogfood-corpus/`) — not a claim
+> about behavior at scale. Every number here was measured, not estimated;
+> the methodology to reproduce each one is next to it. If a number looks
+> too good (or too small) to be meaningful, that's usually because the
+> corpus is small — see the caveat on each section.
 
 ## Methodology (applies to every section below)
 
@@ -30,6 +31,13 @@
   including it.
 - Every run starts from a cold project (`.kern/` deleted first) — no
   benchmark here measures a warm/incremental re-index.
+- Sections 2–3 use `examples/sample-specs/` (5 files, the same toy corpus
+  the README's worked examples use). Sections 1 and 5 use
+  [`dogfood-corpus/`](dogfood-corpus) instead — 66 files across 15
+  features with real cross-feature `depends_on` chains, deliberately
+  structurally repetitive (same SPEC/PLAN/TASK frontmatter shape 15 times
+  over), because that repetition is exactly the condition both of those
+  sections measure the effect of. Each section says which corpus it used.
 
 ---
 
@@ -43,30 +51,35 @@ known type is unambiguous enough to merge or create a new type without
 asking. `judge()` — the fallback path — is reserved for the genuinely
 ambiguous middle.
 
-**Real measurement, this corpus**: 34 prose-extracted candidates processed
-(from the free-form file plus the non-frontmatter body text of the
-frontmatter files), **0 fell into the ambiguous zone** — a 0% fallback
-rate. The 4 frontmatter-driven entities and their `depends_on`/`implements`
-relations bypassed candidate classification entirely (deterministic path),
-so they aren't part of this count at all.
+**Real measurement, `dogfood-corpus/`**: 508 prose-extracted candidates
+processed (from the corpus's 6 free-form files plus the non-frontmatter
+body chunks of all 60 frontmatter files), **15 fell into the ambiguous
+zone — a 2.9% fallback rate.** This supersedes an earlier measurement on
+`examples/sample-specs/` (34 candidates, 0% fallback) that this file's own
+prior text correctly flagged as too small a sample to mean anything — 508
+is still not a large corpus, but it's the real number from the corpus this
+repo actually ships, not a toy fixture, and it's over an order of
+magnitude more candidates than the sample it replaces.
 
-**Read this number carefully — it is not "kern has a 0% fallback rate":**
-- The sample is tiny (34 candidates from 5 files). A 0% rate on a sample
-  this size is not statistically meaningful; it just means no candidate in
-  *this specific small corpus* happened to land between the low/high
-  distance thresholds (`low_distance_max: 0.15`, `high_distance_min: 0.35`
-  — themselves [documented placeholders, not tuned](docs/adr) values).
+**Read this number carefully — it is still not "kern's true fallback
+rate" for every corpus:**
+- The 15/508 zone is specific to this corpus's vocabulary and the
+  low/high distance thresholds (`low_distance_max: 0.15`,
+  `high_distance_min: 0.35` — themselves [documented placeholders, not
+  tuned](docs/adr) values). A corpus with denser or more ambiguous
+  domain vocabulary would land differently.
 - This measures the **entity-extraction** fallback rate only. Relation
-  extraction from prose doesn't exist yet (only frontmatter produces real
-  relations today — see the repo's sprint notes for the current gap list),
-  so there's no relation-side fallback rate to report.
-- A real measurement of this metric that means something requires a real,
-  larger, messier corpus — dogfooding against an actual project's specs is
-  the next real step here, not a bigger synthetic example.
+  extraction from prose still doesn't exist — only frontmatter produces
+  real relations today. That's a real, separate gap, not folded into this
+  number.
 
-**How to reproduce**: run `kern serve` against any project and grep its
-stderr for `kern.ontology.fallback_rate` — every line carries the running
-`total`, `fallback_total`, and `rate` as of that candidate.
+**How to reproduce**: `kern project create dogfood --path dogfood-corpus
+--embedding-provider ollama --embedding-model all-minilm
+--extraction-provider ollama --extraction-model llama3.2`, then `kern
+serve --project dogfood`, grepping its stderr for
+`kern.ontology.fallback_rate` — every line carries the running `total`,
+`fallback_total`, and `rate` as of that candidate; the numbers above are
+from the last line.
 
 ---
 
@@ -140,6 +153,58 @@ development: raising the backend's parallelism past its sweet spot made
 indexing *slower*, not faster, on the hardware it was measured on — a
 reminder to measure a change on your own hardware rather than assume more
 concurrency is strictly better.
+
+---
+
+## 5. Semantic routing reliability
+
+`query_ontological` routes a natural-language question either to a real
+graph traversal (fast, deterministic, cites evidence) or a vector-search
+fallback (approximate). The examples' README had already reproduced this
+degrading on a 15-file corpus as an anecdote; `dogfood-corpus/`'s 15
+structurally-identical features made it possible to measure the failure
+rate instead of citing one example.
+
+**Real measurement, before fixing it**: the same question shape ("what is
+the `depends_on` relation for `TASK-0NNb`?") asked once per feature, 15
+times. **0 of 15 used graph traversal — every single one fell back to
+vector search**, and only 8 of those 15 vector-search answers happened to
+land on the right entity anyway (53.3% overall correct). Root cause,
+found by reading the routing code rather than guessing: the
+entity-mention heuristic picked whichever question word matched *any*
+known entity name and was textually longest, with no preference for an
+*exact* name match over a coincidental substring one. A candidate entity
+literally named `depends_on` — itself a bug, the model had extracted a
+relation-type's own field name as if it were a domain entity, from prose
+that discussed the frontmatter mechanism — out-lengthed the real target
+identifier's matched word in every one of the 15 questions, since
+`depends_on` (10 characters) is longer than `TASK-0NNb` (9).
+
+**After fixing both the router (exact match now always wins over a
+substring match) and the extraction path (a candidate whose name collides
+with reserved relation-type vocabulary is rejected before it ever
+reaches the entity table)**: the identical 15-question test now routes
+**15 of 15 via graph traversal**, with the correct entity resolved every
+time.
+
+A third, unrelated bug surfaced during this verification: `kern serve`
+reprocesses the whole corpus on every restart (no incremental cache yet —
+see [Indexing throughput](README.md#indexing-throughput)), and
+`record_relation` had no deduplication, so every restart against an
+already-indexed project silently duplicated every frontmatter-derived
+relation. `dogfood-corpus/` had been indexed twice while measuring this,
+and its relation count was exactly 2x the expected 75 as a result — not
+noise, a real correctness bug independent of the routing fix. Now fixed
+with a `UNIQUE(type_id, source_entity_id, target_entity_id)` constraint
+and `INSERT OR IGNORE`, the same idiom already used for type
+deduplication.
+
+**How to reproduce**: `kern project create dogfood --path dogfood-corpus
+--embedding-provider ollama --embedding-model all-minilm
+--extraction-provider ollama --extraction-model llama3.2`, `kern serve
+--project dogfood` once, then ask `query_ontological` "what is the
+depends_on relation for TASK-0NNb?" for `NN` in `01`–`15` and check each
+response's `mode` field.
 
 ---
 

@@ -48,7 +48,13 @@ without needing GraphRAG's external infrastructure.
 4. **Agents are the primary consumer** — the main interface is MCP over
    stdio; the CLI exists for operation and debugging, not as the product
    itself.
-5. **Static binary, no runtime dependency** — download it, run it.
+5. **Static binary, no runtime dependency — for retrieval.** Download the
+   `with-embedding-model` tarball and the vector index (embedding +
+   search) works with zero external services. This does **not** extend to
+   ontology extraction/judging today: that part of the pipeline needs a
+   real LLM backend (Ollama), in every tarball variant, no exceptions yet.
+   Half the pipeline is genuinely dependency-free; the other half isn't —
+   see [Model backend](#model-backend).
 
 ## How it works
 
