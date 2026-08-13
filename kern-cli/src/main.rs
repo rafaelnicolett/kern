@@ -1120,7 +1120,7 @@ mod catch_up_scan_tests {
         );
 
         let results = vector_store
-            .search_hybrid(&vec![0.5; TEST_DIM], "", 10)
+            .search_hybrid(&[0.5; TEST_DIM], "", 10)
             .await
             .unwrap();
         assert!(
