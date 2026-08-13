@@ -17,7 +17,8 @@ pub use frontmatter::{
 };
 pub use metrics::FallbackMetrics;
 pub use sqlite::{
-    SqliteFrontmatterProfileRepository, SqliteInstanceRepository, SqliteTypeRepository,
+    SqliteFrontmatterProfileRepository, SqliteIndexedFileRepository, SqliteInstanceRepository,
+    SqliteTypeRepository,
 };
 
 // kern-model is a dependency declared in this crate's Cargo.toml — used
@@ -194,6 +195,26 @@ pub trait InstanceRepository: Send + Sync {
         entity_id: Uuid,
         new_type_id: Uuid,
     ) -> Result<EntityRecord, OntologyError>;
+}
+
+/// Port: persisted "what was already indexed" state — lives alongside
+/// `TypeRepository`/`InstanceRepository` in the same `registry.db` (see
+/// `SqliteIndexedFileRepository`) even though it isn't ontology data per
+/// se, following the same precedent `FrontmatterProfileRepository`
+/// already set. Used by `kern-cli`'s `catch_up_scan` to skip unchanged
+/// files on every `kern serve` restart instead of reprocessing the whole
+/// corpus every time.
+#[async_trait]
+pub trait IndexedFileRepository: Send + Sync {
+    /// Everything known from the previous successful index — loaded once
+    /// at `catch_up_scan` startup to diff against the corpus on disk.
+    async fn all(&self) -> Result<std::collections::HashMap<String, String>, OntologyError>;
+    /// Upsert, deliberately — a changed file's hash MUST overwrite the
+    /// old one. Unlike every other table in this crate (get-or-create via
+    /// `INSERT OR IGNORE`), this one is a real replace.
+    async fn mark_indexed(&self, file_path: &str, content_hash: &str) -> Result<(), OntologyError>;
+    /// Removes the record for a file no longer present on disk.
+    async fn remove(&self, file_path: &str) -> Result<(), OntologyError>;
 }
 
 /// Decision made by the ontology engine for a candidate.

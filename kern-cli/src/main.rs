@@ -3,19 +3,20 @@
 //! Single runtime: the same binary watches, converts, extracts, indexes, and
 //! serves. See the `ProcessState` state machine below.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use kern_ingest::{
-    BudgetAwareMarkdownChunker, HeuristicTokenCounter, MarkdownChunker, StructuralMarkdownChunker,
+    is_real_change, BudgetAwareMarkdownChunker, HeuristicTokenCounter, MarkdownChunker,
+    StructuralMarkdownChunker,
 };
 use kern_mcp::KernServer;
 use kern_model::{EmbeddingProvider, ExtractionProvider};
 use kern_ontology::{
-    AmbiguousZoneConfig, OntologyEngine, SqliteFrontmatterProfileRepository,
-    SqliteInstanceRepository, SqliteTypeRepository, TypeRepository,
+    AmbiguousZoneConfig, IndexedFileRepository, OntologyEngine, SqliteFrontmatterProfileRepository,
+    SqliteIndexedFileRepository, SqliteInstanceRepository, SqliteTypeRepository, TypeRepository,
 };
 use kern_vector::{ChunkRecord, LanceVectorStore, VectorStore};
 use tracing_subscriber::EnvFilter;
@@ -187,6 +188,7 @@ async fn cmd_project_create(
     types.seed_canonical_vocabulary().await?;
     let _instances = SqliteInstanceRepository::open(&db_path)?;
     let _frontmatter = SqliteFrontmatterProfileRepository::open(&db_path)?;
+    let _indexed_files = SqliteIndexedFileRepository::open(&db_path)?;
 
     let embedding_choice = match (embedding_provider, embedding_model) {
         (Some(provider), Some(model)) => Some(parse_embedding_choice(&provider, model)?),
@@ -296,13 +298,42 @@ struct PendingChunk {
     is_frontmatter_chunk: bool,
 }
 
-/// `indexed` is how many chunks were embedded and stored; `skipped` is how
-/// many were rejected outright by the embedding backend (see
-/// `ModelError::RequestRejected`) and left out of the index rather than
-/// aborting the whole run.
+/// `indexed`/`skipped` as before (chunks embedded+stored / rejected by the
+/// backend and left out). `unchanged_files` is the whole point of this
+/// struct existing — on a warm restart with nothing edited, this should
+/// equal the corpus's file count and `indexed` should be 0. `changed_files`
+/// covers both genuinely new files and edited ones; `deleted_files` is
+/// files that were indexed before but are no longer on disk.
 struct CatchUpSummary {
     indexed: usize,
     skipped: usize,
+    unchanged_files: usize,
+    changed_files: usize,
+    deleted_files: usize,
+}
+
+/// Decrements `file_path`'s remaining-chunk counter; if this was the last
+/// one, persists its new hash so a future scan correctly treats it as
+/// unchanged. Called from both the normal completion path and the
+/// `RequestRejected`-skip path in Phase 2 below — a file with any skipped
+/// chunk still needs to reach this, or it would be reprocessed forever.
+async fn mark_file_complete_if_done(
+    file_path: &str,
+    file_remaining: &HashMap<String, Arc<std::sync::atomic::AtomicUsize>>,
+    file_new_hash: &HashMap<String, String>,
+    indexed_files: &dyn IndexedFileRepository,
+) -> anyhow::Result<()> {
+    let Some(counter) = file_remaining.get(file_path) else {
+        return Ok(());
+    };
+    // fetch_sub returns the value BEFORE decrementing — 1 means this was
+    // the last remaining chunk for this file.
+    if counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        if let Some(hash) = file_new_hash.get(file_path) {
+            indexed_files.mark_indexed(file_path, hash).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn catch_up_scan(
@@ -311,6 +342,18 @@ async fn catch_up_scan(
     embedder: &dyn EmbeddingProvider,
     ontology_engine: Option<&OntologyEngine>,
     chunker: &dyn MarkdownChunker,
+    // Persisted "what was already indexed" state — see
+    // `kern_ontology::IndexedFileRepository`. Diffed against the corpus on
+    // disk below so unchanged files skip chunking/embedding/ontology
+    // entirely instead of the whole corpus being reprocessed on every
+    // `kern serve` launch (real bug reported against a 3710-file
+    // production corpus: a full cold reindex took ~15-20 minutes, every
+    // single time the process restarted). Ontology entities/relations
+    // from a changed file's OLD content, or from a deleted file, are
+    // deliberately NOT cleaned up in this version — see the README's
+    // "Indexing throughput" section for why that's a known, explicit gap
+    // rather than an oversight.
+    indexed_files: &dyn IndexedFileRepository,
     // How many chunks are embedded/enriched concurrently — from
     // `.kern/config.toml`'s `[indexing] chunk_concurrency`
     // (`config::IndexingConfig`), not a hardcoded constant, so a user can
@@ -318,20 +361,65 @@ async fn catch_up_scan(
     // the README's "Indexing throughput" section.
     chunk_concurrency: usize,
 ) -> anyhow::Result<CatchUpSummary> {
-    // Phase 1 — serial, cheap: read + chunk each file and run frontmatter
-    // ingestion (deterministic parse, plus at most one LLM call ever per
-    // new key-shape, cached thereafter) in sorted file order. Kept serial
-    // on purpose: `walk_markdown_files` sorts specifically so a numbered
-    // corpus resolves forward references (`depends_on: [X]` before X is
-    // ingested) with fewer transient placeholders — a quality property,
-    // not a correctness requirement (placeholders always resolve correctly
-    // via retype, in any order). This phase is SQLite + a rarely-hit LLM
-    // call, never the bottleneck the concurrency below targets.
+    let known_hashes: HashMap<PathBuf, String> = indexed_files
+        .all()
+        .await?
+        .into_iter()
+        .map(|(path, hash)| (PathBuf::from(path), hash))
+        .collect();
+    let current_files = walk_markdown_files(root)?;
+    let current_set: HashSet<&PathBuf> = current_files.iter().collect();
+
+    // Phase 0 — deletion detection: a file that was indexed before but no
+    // longer exists on disk. Vector cleanup is exact — chunks are
+    // exclusively owned by their file, `delete_by_file` already existed
+    // for exactly this, just never called anywhere. Ontology cleanup is
+    // NOT attempted (same documented v1 gap as changed files below).
+    let mut deleted_files = 0usize;
+    for path in known_hashes.keys() {
+        if !current_set.contains(path) {
+            let file_path = path.to_string_lossy().to_string();
+            vector_store.delete_by_file(&file_path).await?;
+            indexed_files.remove(&file_path).await?;
+            deleted_files += 1;
+        }
+    }
+
+    // Phase 1 — serial, cheap: for every file currently on disk, check
+    // whether its content actually changed since the last successful
+    // index (a blake3 hash comparison, not a mtime check — `is_real_change`)
+    // BEFORE paying for chunking, embedding, or ontology enrichment. This
+    // is the entire point of this feature: an unchanged file now costs
+    // one read + one hash compare instead of a full reprocess. Kept
+    // serial for the same reason as before: `walk_markdown_files`'s
+    // sorted order still matters for forward-reference resolution
+    // quality when files DO get reprocessed, and hashing text files
+    // locally is fast enough (blake3, GB/s) that this phase was never the
+    // bottleneck the concurrency in Phase 2 targets.
     let mut pending = Vec::new();
-    for entry in walk_markdown_files(root)? {
-        let content = std::fs::read_to_string(&entry)?;
-        let chunks = chunker.chunk(&entry, &content);
+    let mut file_remaining: HashMap<String, Arc<std::sync::atomic::AtomicUsize>> = HashMap::new();
+    let mut file_new_hash: HashMap<String, String> = HashMap::new();
+    let mut unchanged_files = 0usize;
+    let mut changed_files = 0usize;
+
+    for entry in &current_files {
+        let content = std::fs::read_to_string(entry)?;
         let entry_path = entry.to_string_lossy().to_string();
+
+        let Some(new_hash) = is_real_change(entry, &content, &known_hashes) else {
+            unchanged_files += 1;
+            continue;
+        };
+        changed_files += 1;
+
+        // Already indexed under a different hash — clear its stale chunks
+        // before the new ones land, so a reindex never leaves duplicate
+        // or orphaned chunk rows behind.
+        if known_hashes.contains_key(entry) {
+            vector_store.delete_by_file(&entry_path).await?;
+        }
+
+        let chunks = chunker.chunk(entry, &content);
 
         let mut skip_prose_on_first_chunk = false;
         if let Some(engine) = ontology_engine {
@@ -353,6 +441,19 @@ async fn catch_up_scan(
             }
         }
 
+        if chunks.is_empty() {
+            // Nothing to embed for this file — mark it indexed right
+            // away, there's nothing to wait for in Phase 2.
+            indexed_files.mark_indexed(&entry_path, &new_hash).await?;
+            continue;
+        }
+
+        file_remaining.insert(
+            entry_path.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(chunks.len())),
+        );
+        file_new_hash.insert(entry_path, new_hash);
+
         for (i, chunk) in chunks.into_iter().enumerate() {
             let file_path = chunk.file_path.to_string_lossy().to_string();
             pending.push(PendingChunk {
@@ -361,6 +462,16 @@ async fn catch_up_scan(
                 is_frontmatter_chunk: i == 0 && skip_prose_on_first_chunk,
             });
         }
+    }
+
+    if ontology_engine.is_some() && (changed_files > 0 || deleted_files > 0) {
+        tracing::warn!(
+            changed_files,
+            deleted_files,
+            "ontology entities/relations from changed files' previous content, or from deleted \
+             files, are not removed by this scan — additive-only until a future ontology \
+             garbage-collection feature; see the README's \"Indexing throughput\" section"
+        );
     }
 
     // Phase 2 — concurrent, expensive: embedding and ontology enrichment
@@ -385,13 +496,17 @@ async fn catch_up_scan(
     // `ModelError::RequestRejected` distinguishes "backend rejected this
     // specific input" from a real connectivity failure — only the latter
     // still aborts the run; the former is logged and skipped so the rest
-    // of a real, messy corpus still indexes.
+    // of a real, messy corpus still indexes. A skipped chunk's file still
+    // gets marked indexed (see `mark_file_complete_if_done`) — reprocessing
+    // identical bytes next launch would just reject it again.
     let indexed = std::sync::atomic::AtomicUsize::new(0);
     let skipped = std::sync::atomic::AtomicUsize::new(0);
     stream::iter(pending.into_iter().map(Ok::<_, anyhow::Error>))
         .try_for_each_concurrent(Some(chunk_concurrency), |item| {
             let indexed = &indexed;
             let skipped = &skipped;
+            let file_remaining = &file_remaining;
+            let file_new_hash = &file_new_hash;
             async move {
                 let embedding = match embedder.embed(&item.chunk.content).await {
                     Ok(embedding) => embedding,
@@ -406,6 +521,13 @@ async fn catch_up_scan(
                              table too large for its context window, kept whole rather than \
                              split; skipping this chunk, the rest of the corpus still indexes"
                         );
+                        mark_file_complete_if_done(
+                            &item.file_path,
+                            file_remaining,
+                            file_new_hash,
+                            indexed_files,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     Err(e) => return Err(e.into()),
@@ -429,7 +551,7 @@ async fn catch_up_scan(
                 vector_store
                     .upsert(ChunkRecord {
                         id: item.chunk.id,
-                        file_path: item.file_path,
+                        file_path: item.file_path.clone(),
                         content: item.chunk.content,
                         embedding,
                         content_hash: item.chunk.content_hash,
@@ -437,6 +559,13 @@ async fn catch_up_scan(
                     })
                     .await?;
                 indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                mark_file_complete_if_done(
+                    &item.file_path,
+                    file_remaining,
+                    file_new_hash,
+                    indexed_files,
+                )
+                .await?;
                 Ok(())
             }
         })
@@ -445,6 +574,9 @@ async fn catch_up_scan(
     Ok(CatchUpSummary {
         indexed: indexed.load(std::sync::atomic::Ordering::Relaxed),
         skipped: skipped.load(std::sync::atomic::Ordering::Relaxed),
+        unchanged_files,
+        changed_files,
+        deleted_files,
     })
 }
 
@@ -533,6 +665,8 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
         Arc::new(SqliteInstanceRepository::open(&db_path)?);
     let frontmatter_profiles: Arc<dyn kern_ontology::FrontmatterProfileRepository> =
         Arc::new(SqliteFrontmatterProfileRepository::open(&db_path)?);
+    let indexed_files: Arc<dyn IndexedFileRepository> =
+        Arc::new(SqliteIndexedFileRepository::open(&db_path)?);
     let mut lance_store = LanceVectorStore::open(&root.join(".kern").join("vectors")).await?;
     lance_store
         .ensure_table(project_config.embedding.dimension)
@@ -558,6 +692,7 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
         embedder.as_ref(),
         ontology_engine.as_ref(),
         &chunker,
+        indexed_files.as_ref(),
         project_config.indexing.chunk_concurrency,
     )
     .await?;
@@ -571,6 +706,9 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
     tracing::info!(
         chunks_indexed = summary.indexed,
         chunks_skipped = summary.skipped,
+        unchanged_files = summary.unchanged_files,
+        changed_files = summary.changed_files,
+        deleted_files = summary.deleted_files,
         "catch-up complete"
     );
 
@@ -804,5 +942,282 @@ async fn main() -> anyhow::Result<()> {
                     model,
                 },
         } => cmd_config_set_extraction(project, provider, model).await,
+    }
+}
+
+#[cfg(test)]
+mod catch_up_scan_tests {
+    use super::*;
+
+    /// Fails on exactly the input strings registered via `fail_for`, with
+    /// whichever `ModelError` variant is configured — otherwise returns a
+    /// fixed embedding. Real, in-process, no network — this is what lets
+    /// these tests assert on exact embed() call counts.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailureMode {
+        RequestRejected,
+        BackendUnavailable,
+    }
+
+    struct CountingEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+        dim: usize,
+        fail_for: std::sync::Mutex<HashMap<String, FailureMode>>,
+    }
+
+    impl CountingEmbedder {
+        fn new(dim: usize) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                dim,
+                fail_for: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn fail(&self, content: &str, mode: FailureMode) {
+            self.fail_for
+                .lock()
+                .unwrap()
+                .insert(content.to_string(), mode);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for CountingEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, kern_model::ModelError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(mode) = self.fail_for.lock().unwrap().get(text) {
+                return match mode {
+                    FailureMode::RequestRejected => Err(kern_model::ModelError::RequestRejected {
+                        status: 500,
+                        body: "input too large to process".to_string(),
+                    }),
+                    FailureMode::BackendUnavailable => {
+                        Err(kern_model::ModelError::BackendUnavailable(
+                            "connection refused".to_string(),
+                        ))
+                    }
+                };
+            }
+            Ok(vec![0.5; self.dim])
+        }
+
+        async fn capabilities(
+            &self,
+        ) -> Result<kern_model::EmbeddingCapabilities, kern_model::ModelError> {
+            Ok(kern_model::EmbeddingCapabilities {
+                model_id: "fake".to_string(),
+                embedding_dim: self.dim,
+                max_input_tokens: None,
+            })
+        }
+    }
+
+    const TEST_DIM: usize = 8;
+
+    async fn open_store(dir: &Path) -> LanceVectorStore {
+        let mut store = LanceVectorStore::open(dir).await.unwrap();
+        store.ensure_table(TEST_DIM as i32).await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn second_scan_of_an_unchanged_corpus_embeds_nothing() {
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(corpus.path().join("a.md"), "# A\n\nContent A.\n").unwrap();
+        std::fs::write(corpus.path().join("b.md"), "# B\n\nContent B.\n").unwrap();
+
+        let embedder = CountingEmbedder::new(TEST_DIM);
+        let vector_store = open_store(&state.path().join("vectors")).await;
+        let indexed_files =
+            SqliteIndexedFileRepository::open(&state.path().join("registry.db")).unwrap();
+        let chunker = StructuralMarkdownChunker;
+
+        let first = catch_up_scan(
+            corpus.path(),
+            &vector_store,
+            &embedder,
+            None,
+            &chunker,
+            &indexed_files,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.indexed, 2);
+        assert_eq!(first.changed_files, 2);
+        assert_eq!(first.unchanged_files, 0);
+        let calls_after_first = embedder.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(calls_after_first > 0);
+
+        let second = catch_up_scan(
+            corpus.path(),
+            &vector_store,
+            &embedder,
+            None,
+            &chunker,
+            &indexed_files,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.indexed, 0, "nothing changed, nothing to embed");
+        assert_eq!(second.unchanged_files, 2);
+        assert_eq!(second.changed_files, 0);
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_first,
+            "a second scan of an unchanged corpus must not call embed() again"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_file_is_reindexed_and_deleted_file_is_removed_from_the_vector_store() {
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(corpus.path().join("a.md"), "# A\n\nOriginal content.\n").unwrap();
+        std::fs::write(corpus.path().join("b.md"), "# B\n\nContent B.\n").unwrap();
+
+        let embedder = CountingEmbedder::new(TEST_DIM);
+        let vector_store = open_store(&state.path().join("vectors")).await;
+        let indexed_files =
+            SqliteIndexedFileRepository::open(&state.path().join("registry.db")).unwrap();
+        let chunker = StructuralMarkdownChunker;
+
+        catch_up_scan(
+            corpus.path(),
+            &vector_store,
+            &embedder,
+            None,
+            &chunker,
+            &indexed_files,
+            4,
+        )
+        .await
+        .unwrap();
+        let calls_after_first = embedder.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        std::fs::write(corpus.path().join("a.md"), "# A\n\nEdited content.\n").unwrap();
+        std::fs::remove_file(corpus.path().join("b.md")).unwrap();
+
+        let second = catch_up_scan(
+            corpus.path(),
+            &vector_store,
+            &embedder,
+            None,
+            &chunker,
+            &indexed_files,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.changed_files, 1, "only a.md was edited");
+        assert_eq!(second.deleted_files, 1, "b.md was removed from disk");
+        assert!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst) > calls_after_first,
+            "the edited file's new content should have been embedded"
+        );
+
+        let results = vector_store
+            .search_hybrid(&vec![0.5; TEST_DIM], "", 10)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| !r.chunk.file_path.contains("b.md")),
+            "the deleted file's chunks should be gone from the vector store: {:?}",
+            results
+                .iter()
+                .map(|r| &r.chunk.file_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_skipped_via_request_rejected_still_marks_its_file_indexed() {
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let bad_content = "# Bad\n\nToo big for the backend.\n";
+        std::fs::write(corpus.path().join("bad.md"), bad_content).unwrap();
+
+        let embedder = CountingEmbedder::new(TEST_DIM);
+        embedder.fail(bad_content, FailureMode::RequestRejected);
+        let vector_store = open_store(&state.path().join("vectors")).await;
+        let indexed_files =
+            SqliteIndexedFileRepository::open(&state.path().join("registry.db")).unwrap();
+        let chunker = StructuralMarkdownChunker;
+
+        let first = catch_up_scan(
+            corpus.path(),
+            &vector_store,
+            &embedder,
+            None,
+            &chunker,
+            &indexed_files,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.indexed, 0);
+        assert_eq!(first.skipped, 1);
+        let calls_after_first = embedder.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        let second = catch_up_scan(
+            corpus.path(),
+            &vector_store,
+            &embedder,
+            None,
+            &chunker,
+            &indexed_files,
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.unchanged_files, 1,
+            "the file should be marked indexed despite the skipped chunk, so a rescan treats \
+             identical bytes as unchanged instead of retrying forever"
+        );
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_first,
+            "no re-embed attempt against the same rejected content"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_failure_mid_scan_does_not_mark_the_failing_file_indexed() {
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let bad_content = "# Bad\n\nWill fail.\n";
+        std::fs::write(corpus.path().join("bad.md"), bad_content).unwrap();
+
+        let embedder = CountingEmbedder::new(TEST_DIM);
+        embedder.fail(bad_content, FailureMode::BackendUnavailable);
+        let vector_store = open_store(&state.path().join("vectors")).await;
+        let indexed_files =
+            SqliteIndexedFileRepository::open(&state.path().join("registry.db")).unwrap();
+        let chunker = StructuralMarkdownChunker;
+
+        let result = catch_up_scan(
+            corpus.path(),
+            &vector_store,
+            &embedder,
+            None,
+            &chunker,
+            &indexed_files,
+            4,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a genuine backend failure should abort catch_up_scan, not be silently skipped"
+        );
+
+        let known = indexed_files.all().await.unwrap();
+        assert!(
+            known.is_empty(),
+            "the failing file must not be marked indexed, so a retry reprocesses it"
+        );
     }
 }

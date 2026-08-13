@@ -2767,6 +2767,7 @@ name = "kern-cli"
 version = "0.3.3"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "dirs 5.0.1",
  "flate2",

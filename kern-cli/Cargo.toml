@@ -38,3 +38,4 @@ bundled-llama-server = ["dep:tar", "dep:flate2"]
 
 [dev-dependencies]
 tempfile = "3"
+async-trait.workspace = true

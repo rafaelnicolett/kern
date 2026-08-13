@@ -14,8 +14,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::{
-    EntityRecord, InstanceRepository, OntologyError, RelationRecord, RelationTypeRecord,
-    RelationTypeStatus, TypeRepository, SEED_RELATION_TYPES,
+    EntityRecord, IndexedFileRepository, InstanceRepository, OntologyError, RelationRecord,
+    RelationTypeRecord, RelationTypeStatus, TypeRepository, SEED_RELATION_TYPES,
 };
 
 fn open_connection(path: &Path) -> Result<Connection, OntologyError> {
@@ -761,6 +761,83 @@ impl crate::frontmatter::FrontmatterProfileRepository for SqliteFrontmatterProfi
     }
 }
 
+/// Persisted "what was already indexed" state — `kern-cli`'s
+/// `catch_up_scan` diffs the corpus on disk against this on every `kern
+/// serve` startup, so unchanged files skip chunking/embedding/ontology
+/// entirely instead of the whole corpus being reprocessed every launch.
+pub struct SqliteIndexedFileRepository {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteIndexedFileRepository {
+    pub fn open(path: &Path) -> Result<Self, OntologyError> {
+        let conn = open_connection(path)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS indexed_files (
+                file_path TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                indexed_at TEXT NOT NULL
+            );",
+        )?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+}
+
+#[async_trait]
+impl IndexedFileRepository for SqliteIndexedFileRepository {
+    async fn all(&self) -> Result<std::collections::HashMap<String, String>, OntologyError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT file_path, content_hash FROM indexed_files")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let file_path: String = row.get(0)?;
+                    let content_hash: String = row.get(1)?;
+                    Ok((file_path, content_hash))
+                })?
+                .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+            Ok::<_, OntologyError>(rows)
+        })
+        .await?
+    }
+
+    /// Upsert, deliberately — see the trait doc: a changed file's hash
+    /// must overwrite the old one, unlike the get-or-create semantics
+    /// everywhere else in this crate.
+    async fn mark_indexed(&self, file_path: &str, content_hash: &str) -> Result<(), OntologyError> {
+        let conn = self.conn.clone();
+        let file_path = file_path.to_string();
+        let content_hash = content_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO indexed_files (file_path, content_hash, indexed_at)
+                 VALUES (?1, ?2, ?3)",
+                params![file_path, content_hash, now()],
+            )?;
+            Ok::<_, OntologyError>(())
+        })
+        .await?
+    }
+
+    async fn remove(&self, file_path: &str) -> Result<(), OntologyError> {
+        let conn = self.conn.clone();
+        let file_path = file_path.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM indexed_files WHERE file_path = ?1",
+                params![file_path],
+            )?;
+            Ok::<_, OntologyError>(())
+        })
+        .await?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,5 +1227,65 @@ mod tests {
 
         let relation_types = types.list_relation_types().await.unwrap();
         assert_eq!(relation_types.len(), SEED_RELATION_TYPES.len());
+    }
+
+    #[tokio::test]
+    async fn indexed_files_all_returns_empty_map_when_nothing_indexed_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqliteIndexedFileRepository::open(&dir.path().join("registry.db")).unwrap();
+        assert!(repo.all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mark_indexed_then_all_reflects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqliteIndexedFileRepository::open(&dir.path().join("registry.db")).unwrap();
+
+        repo.mark_indexed("docs/a.md", "hash-a").await.unwrap();
+        repo.mark_indexed("docs/b.md", "hash-b").await.unwrap();
+
+        let all = repo.all().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("docs/a.md"), Some(&"hash-a".to_string()));
+        assert_eq!(all.get("docs/b.md"), Some(&"hash-b".to_string()));
+    }
+
+    /// The one table in this file that's a real upsert, not get-or-create
+    /// like every sibling table — a changed file's hash must overwrite
+    /// the old one, not be ignored. Dedicated regression test.
+    #[tokio::test]
+    async fn mark_indexed_overwrites_existing_hash_for_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqliteIndexedFileRepository::open(&dir.path().join("registry.db")).unwrap();
+
+        repo.mark_indexed("docs/a.md", "old-hash").await.unwrap();
+        repo.mark_indexed("docs/a.md", "new-hash").await.unwrap();
+
+        let all = repo.all().await.unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "re-marking the same file should overwrite, not add a second row"
+        );
+        assert_eq!(all.get("docs/a.md"), Some(&"new-hash".to_string()));
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqliteIndexedFileRepository::open(&dir.path().join("registry.db")).unwrap();
+
+        repo.mark_indexed("docs/a.md", "hash-a").await.unwrap();
+        repo.remove("docs/a.md").await.unwrap();
+
+        assert!(repo.all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_of_an_unknown_file_is_a_harmless_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SqliteIndexedFileRepository::open(&dir.path().join("registry.db")).unwrap();
+
+        repo.remove("docs/never-indexed.md").await.unwrap();
     }
 }
