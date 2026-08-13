@@ -212,3 +212,82 @@ async fn budget_aware_chunker_closes_the_context_window_bug_against_real_llama_c
         });
     }
 }
+
+/// Real bug found empirically on a 3710-file real corpus: a Markdown
+/// table too large to fit the context window (a real page's HTTP status
+/// code reference table with embedded code samples was the actual
+/// offender) is — correctly — kept whole by `BudgetAwareMarkdownChunker`
+/// rather than split, since splitting a table mid-row would corrupt it.
+/// The real backend then rejects that one chunk with a non-2xx response.
+/// Before this fix, that rejection surfaced as `ModelError::BackendUnavailable`
+/// — the same bucket as "the backend is down" — and kern-cli's
+/// `catch_up_scan` aborted the ENTIRE indexing run on it, losing all
+/// progress over one oversized table out of thousands of files. This
+/// proves the fix at its root: the real backend's rejection of a real
+/// oversized table now classifies as `ModelError::RequestRejected`
+/// specifically, not `BackendUnavailable` — the distinction
+/// `catch_up_scan` needs to skip just this one chunk instead of aborting.
+#[tokio::test]
+async fn oversized_protected_table_is_classified_as_request_rejected_not_backend_unavailable() {
+    let Some(binary) = find_llama_server_binary() else {
+        eprintln!("llama-server not found on PATH — skipping integration test");
+        return;
+    };
+    let Some(model) = find_test_gguf_model() else {
+        eprintln!(
+            "test model ~/.cache/kern/models/bge-small-en-v1.5-q4_k_m.gguf \
+             not found — skipping integration test"
+        );
+        return;
+    };
+
+    let budget = 64;
+    let runtime =
+        match kern_model::LlamaCppRuntime::spawn(&binary, &model, 8793, budget as u32).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("llama-server failed to start ({e}) — skipping integration test");
+                return;
+            }
+        };
+
+    // A real-shaped offender: a status-code reference table with an
+    // embedded code sample per row, like the real page that surfaced
+    // this bug — not an adversarially malformed fixture.
+    let mut table = String::from(
+        "| Status | Meaning | Example handler |\n|---|---|---|\n",
+    );
+    for i in 200..260 {
+        table.push_str(&format!(
+            "| {i} | HTTP status {i} | `public ResponseEntity<Object> handle{i}(Exception e) {{ \
+             return ResponseEntity.status({i}).body(new ErrorPayload(e.getMessage())); }}` |\n"
+        ));
+    }
+    let markdown = format!("# API Response Codes\n\n{table}\n\n# Short Section\n\nJust a short paragraph here.\n");
+
+    let chunker = BudgetAwareMarkdownChunker::new(
+        StructuralMarkdownChunker,
+        Box::new(HeuristicTokenCounter),
+        budget,
+    );
+    let chunks = chunker.chunk(Path::new("api-response-codes.md"), &markdown);
+
+    let big_table_chunk = chunks
+        .iter()
+        .find(|c| c.content.contains("| Status | Meaning"))
+        .expect("the table should survive as one whole chunk, per the never-split invariant");
+
+    match runtime.embed(&big_table_chunk.content).await {
+        Err(kern_model::ModelError::RequestRejected { .. }) => {} // expected
+        Err(other) => panic!(
+            "expected ModelError::RequestRejected for an oversized chunk the backend rejects, \
+             got a different error variant instead: {other:?} — catch_up_scan would treat this \
+             as a fatal backend failure and abort the whole indexing run"
+        ),
+        Ok(_) => panic!(
+            "expected the real backend to reject this oversized table (budget: {budget}) — if \
+             it now embeds successfully, the fixture needs to be bigger, not this assertion \
+             removed"
+        ),
+    }
+}

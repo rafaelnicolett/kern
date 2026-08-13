@@ -296,6 +296,15 @@ struct PendingChunk {
     is_frontmatter_chunk: bool,
 }
 
+/// `indexed` is how many chunks were embedded and stored; `skipped` is how
+/// many were rejected outright by the embedding backend (see
+/// `ModelError::RequestRejected`) and left out of the index rather than
+/// aborting the whole run.
+struct CatchUpSummary {
+    indexed: usize,
+    skipped: usize,
+}
+
 async fn catch_up_scan(
     root: &Path,
     vector_store: &dyn VectorStore,
@@ -308,7 +317,7 @@ async fn catch_up_scan(
     // tune it for their own hardware/backend without a code change. See
     // the README's "Indexing throughput" section.
     chunk_concurrency: usize,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<CatchUpSummary> {
     // Phase 1 — serial, cheap: read + chunk each file and run frontmatter
     // ingestion (deterministic parse, plus at most one LLM call ever per
     // new key-shape, cached thereafter) in sorted file order. Kept serial
@@ -359,16 +368,48 @@ async fn catch_up_scan(
     // indexing. `try_for_each_concurrent` overlaps up to `chunk_concurrency`
     // of them at once instead of paying each one's latency back to back,
     // and still fails fast (stops launching new work, propagates the
-    // error) on the first embed/upsert failure, matching the original
-    // serial loop's behavior. A `process_chunk` (ontology) failure is
-    // still logged and skipped, not fatal — vector indexing for that chunk
+    // error) on a genuine backend failure, matching the original serial
+    // loop's behavior. A `process_chunk` (ontology) failure is still
+    // logged and skipped, not fatal — vector indexing for that chunk
     // still completes.
+    //
+    // Real bug found empirically on a 3710-file real corpus: a code
+    // block/table `kern-ingest`'s chunker correctly kept whole (never
+    // splitting one is a deliberate invariant — see
+    // BudgetAwareMarkdownChunker) can still be too large for the
+    // embedding backend's context window, which then rejects it with a
+    // non-2xx response. Treating that the same as "the backend is down"
+    // (the old, single ModelError::BackendUnavailable bucket) meant ONE
+    // oversized chunk out of thousands aborted the entire indexing run,
+    // losing all progress — the whole corpus, not just that one chunk.
+    // `ModelError::RequestRejected` distinguishes "backend rejected this
+    // specific input" from a real connectivity failure — only the latter
+    // still aborts the run; the former is logged and skipped so the rest
+    // of a real, messy corpus still indexes.
     let indexed = std::sync::atomic::AtomicUsize::new(0);
+    let skipped = std::sync::atomic::AtomicUsize::new(0);
     stream::iter(pending.into_iter().map(Ok::<_, anyhow::Error>))
         .try_for_each_concurrent(Some(chunk_concurrency), |item| {
             let indexed = &indexed;
+            let skipped = &skipped;
             async move {
-                let embedding = embedder.embed(&item.chunk.content).await?;
+                let embedding = match embedder.embed(&item.chunk.content).await {
+                    Ok(embedding) => embedding,
+                    Err(kern_model::ModelError::RequestRejected { status, body }) => {
+                        skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            file = %item.file_path,
+                            chunk_id = %item.chunk.id,
+                            status,
+                            body = %body.chars().take(300).collect::<String>(),
+                            "embedding backend rejected this chunk — likely a code block or \
+                             table too large for its context window, kept whole rather than \
+                             split; skipping this chunk, the rest of the corpus still indexes"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 if !item.is_frontmatter_chunk {
                     if let Some(engine) = ontology_engine {
@@ -401,7 +442,10 @@ async fn catch_up_scan(
         })
         .await?;
 
-    Ok(indexed.load(std::sync::atomic::Ordering::Relaxed))
+    Ok(CatchUpSummary {
+        indexed: indexed.load(std::sync::atomic::Ordering::Relaxed),
+        skipped: skipped.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 fn now_timestamp() -> String {
@@ -508,7 +552,7 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
 
     state = ProcessState::CatchUpScan;
     tracing::info!(?state, "catch-up scan — indexing corpus");
-    let indexed = catch_up_scan(
+    let summary = catch_up_scan(
         &root,
         vector_store.as_ref(),
         embedder.as_ref(),
@@ -517,7 +561,18 @@ async fn cmd_serve(project: String) -> anyhow::Result<()> {
         project_config.indexing.chunk_concurrency,
     )
     .await?;
-    tracing::info!(chunks_indexed = indexed, "catch-up complete");
+    if summary.skipped > 0 {
+        tracing::warn!(
+            chunks_skipped = summary.skipped,
+            "some chunks were rejected by the embedding backend and left out of the index — \
+             see the individual warnings above for which files/chunks and why"
+        );
+    }
+    tracing::info!(
+        chunks_indexed = summary.indexed,
+        chunks_skipped = summary.skipped,
+        "catch-up complete"
+    );
 
     state = ProcessState::Ready;
     tracing::info!(?state, "ready — serving MCP via stdio");

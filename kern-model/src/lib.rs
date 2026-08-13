@@ -16,6 +16,15 @@ pub enum ModelError {
     BackendUnavailable(String),
     #[error("malformed inference response: {0}")]
     MalformedResponse(String),
+    /// The backend was reachable and responded, but rejected THIS
+    /// specific request (real example: llama-server returning 500 for a
+    /// single input that exceeds its context window — a code block or
+    /// table `kern-ingest`'s chunker deliberately kept whole rather than
+    /// splitting it). Distinct from `BackendUnavailable` on purpose: this
+    /// is a per-request failure a caller can skip and move on from,
+    /// never a signal that the backend itself is down.
+    #[error("backend rejected the request (status {status}): {body}")]
+    RequestRejected { status: u16, body: String },
     #[error("HTTP request to backend failed: {0}")]
     Http(#[from] reqwest::Error),
     // TODO: timeout variants, model not loaded, etc.
@@ -228,16 +237,30 @@ impl LlamaCppRuntime {
 #[async_trait]
 impl EmbeddingProvider for LlamaCppRuntime {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, ModelError> {
+        // `.send()` failing is the real "can't reach the backend" case —
+        // stays a plain `?` (-> ModelError::Http), correctly fatal to the
+        // caller. Once a response comes back at all, the backend is
+        // reachable by definition — a non-2xx status here is the backend
+        // rejecting THIS specific input (real case: a code block/table
+        // kern-ingest kept whole because splitting it isn't safe, too
+        // large for this model's context window), not a sign it's down.
+        // Real bug found empirically: collapsing both cases into
+        // `BackendUnavailable` made a single oversized chunk kill the
+        // entire indexing run instead of just that one chunk.
         let response = self
             .http
             .post(format!("{}/v1/embeddings", self.base_url))
             .json(&OpenAiEmbedRequest { input: text })
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| ModelError::BackendUnavailable(e.to_string()))?
-            .json::<OpenAiEmbedResponse>()
             .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ModelError::RequestRejected { status, body });
+        }
+
+        let response = response.json::<OpenAiEmbedResponse>().await?;
 
         response
             .data
@@ -420,6 +443,9 @@ impl OllamaClient {
 #[async_trait]
 impl EmbeddingProvider for OllamaClient {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, ModelError> {
+        // See LlamaCppRuntime::embed's comment — same distinction: a
+        // non-2xx status on a response that DID arrive means the backend
+        // rejected this input, not that it's unreachable.
         let response = self
             .http
             .post(format!("{}/api/embed", self.base_url))
@@ -428,11 +454,15 @@ impl EmbeddingProvider for OllamaClient {
                 input: text,
             })
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| ModelError::BackendUnavailable(e.to_string()))?
-            .json::<EmbedResponse>()
             .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ModelError::RequestRejected { status, body });
+        }
+
+        let response = response.json::<EmbedResponse>().await?;
 
         response
             .embeddings
