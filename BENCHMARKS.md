@@ -30,7 +30,8 @@
   everything below — every number here is from `kern serve` onward, not
   including it.
 - Every run starts from a cold project (`.kern/` deleted first) — no
-  benchmark here measures a warm/incremental re-index.
+  benchmark in sections 1–5 measures a warm/incremental re-index (section
+  6 does, separately, once incremental reindexing existed to measure).
 - Sections 2–3 use `examples/sample-specs/` (5 files, the same toy corpus
   the README's worked examples use). Sections 1 and 5 use
   [`dogfood-corpus/`](dogfood-corpus) instead — 66 files across 15
@@ -187,9 +188,10 @@ reaches the entity table)**: the identical 15-question test now routes
 **15 of 15 via graph traversal**, with the correct entity resolved every
 time.
 
-A third, unrelated bug surfaced during this verification: `kern serve`
-reprocesses the whole corpus on every restart (no incremental cache yet —
-see [Indexing throughput](README.md#indexing-throughput)), and
+A third, unrelated bug surfaced during this verification: at the time,
+`kern serve` reprocessed the whole corpus on every restart (no incremental
+cache existed yet — see [Incremental reindexing](README.md#incremental-reindexing),
+added since), and
 `record_relation` had no deduplication, so every restart against an
 already-indexed project silently duplicated every frontmatter-derived
 relation. `dogfood-corpus/` had been indexed twice while measuring this,
@@ -205,6 +207,44 @@ deduplication.
 --project dogfood` once, then ask `query_ontological` "what is the
 depends_on relation for TASK-0NNb?" for `NN` in `01`–`15` and check each
 response's `mode` field.
+
+---
+
+## 6. Incremental reindexing — cold vs. warm restart
+
+The motivating real-world report for this feature: an external test
+against a 3710-file production corpus measured a full cold reindex at
+~15-20 minutes, on **every** `kern serve` launch — no caching across
+restarts existed at all. That's untenable for an MCP server spawned per
+chat session. See [Incremental reindexing](README.md#incremental-reindexing)
+for how this works; this section is the before/after measurement.
+
+**Real measurement, `dogfood-corpus/` (66 files, 245 chunks), Ollama
+backend, three consecutive `kern serve` runs against the same project,
+no `.kern/` deleted between them:**
+
+| Run | What changed on disk | Result |
+|---|---|---|
+| 1 (cold) | nothing indexed yet | `chunks_indexed=245 unchanged_files=0 changed_files=66` — **~104.2s** |
+| 2 (warm) | nothing | `chunks_indexed=0 unchanged_files=66 changed_files=0` — **~0.39s** |
+| 3 (one edit + one deletion) | 1 file appended to, 1 file removed | `chunks_indexed=7 unchanged_files=64 changed_files=1 deleted_files=1` — only the edited file's 7 chunks were re-embedded |
+
+Run 1 → run 2 is a **~267x** reduction in wall-clock time for the common
+case (nothing changed since last launch) — measured directly from the
+`starting`/`catch-up complete` log timestamps, not estimated. Run 3
+confirms the diff is real and selective, not all-or-nothing: 64 of 66
+files correctly skipped, only the genuinely changed file cost anything,
+and the deleted file's chunks were removed from the vector index rather
+than left stale.
+
+**How to reproduce**: `kern project create dogfood --path dogfood-corpus
+--embedding-provider ollama --embedding-model all-minilm
+--extraction-provider ollama --extraction-model llama3.2`, then run `kern
+serve --project dogfood` twice in a row with nothing changed on disk
+between runs, comparing the `starting`/`catch-up complete` log line
+timestamps; edit one file and delete another, run a third time, and check
+the `changed_files`/`deleted_files`/`unchanged_files` counts on the
+`catch-up complete` line.
 
 ---
 

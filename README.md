@@ -139,6 +139,33 @@ Whatever the source, chunk sizing itself adapts to the configured
 provider's reported context window — never a hardcoded assumption
 about how much text any given backend can accept in one call.
 
+### Incremental reindexing
+
+`kern serve` diffs the corpus against `.kern/registry.db`'s persisted
+record of what was already indexed (a blake3 hash per file, not a
+timestamp) on every launch — an unchanged file costs one read and one
+hash comparison, not a chunk/embed/enrich pass. On a warm restart with
+nothing edited since the last run, this turns what used to be a full
+corpus reprocess into a few seconds of local I/O, real difference on a
+project with thousands of files. A file whose content actually changed is
+re-chunked and re-embedded, replacing its old chunks in the vector index
+(`unchanged_files`/`changed_files`/`deleted_files` counts are in the
+`catch-up complete` log line — `unchanged_files` equal to the corpus size
+and `chunks_indexed = 0` is the signature of a fully warm restart). A file
+deleted from disk since the last run has its chunks removed from the
+vector index the same way.
+
+**Known limitation, deliberate for now**: this only fully applies to the
+*vector* index. Ontology entities and relations are additive-only — a
+changed file's old contributions, or a deleted file's contributions, are
+never removed from the ontology. A prose-extracted entity can legitimately
+be created from any file that mentions the term (not exclusively "owned"
+by the file it was first seen in), so deleting "everything this file
+contributed" isn't safe to do blindly without real reference counting —
+a genuinely separate, larger feature. Until that lands, expect the
+ontology to accumulate stale entities/relations across edits and deletions
+even though the vector index and search results stay accurate.
+
 ### Indexing throughput
 
 `kern serve`'s catch-up scan embeds and enriches chunks concurrently, not

@@ -81,10 +81,12 @@ python3 examples/query_ontological.py target/release/kern demo "<question>"
 python3 examples/call_tool.py target/release/kern demo <tool-name> '<json-args>'
 ```
 
-Both scripts start a fresh `kern serve` each time — `kern` re-indexes the
-whole corpus on every `serve` invocation today (there's no across-process
-cache yet), so each call below pays the full indexing cost from §2.
-That's current behavior, not a mistake in these scripts.
+Both scripts start a fresh `kern serve` process each time — but `kern`
+persists what it already indexed across restarts (see the README's
+[Incremental reindexing](../README.md#incremental-reindexing)), so only
+the *first* call below pays the full indexing cost from §2. Every call
+after that diffs the corpus against `.kern/registry.db` and finds nothing
+changed, so it's fast — a fresh process, not a fresh index.
 
 ## 4. Walking through each tool
 
