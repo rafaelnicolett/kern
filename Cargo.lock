@@ -2764,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "kern-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "kern-ingest"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "kern-mcp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "kern-ingest",
@@ -2827,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "kern-model"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "kern-ontology"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "kern-vector"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "async-trait",
  "futures",
