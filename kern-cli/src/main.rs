@@ -809,6 +809,13 @@ fn cmd_config_show(project: String) -> anyhow::Result<()> {
             if let Some(ctx) = cfg.embedding.context_size {
                 println!("embedding.context_size = {ctx}");
             }
+            if cfg.embedding.provider == "llama_cpp_embedded" {
+                println!(
+                    "embedding.parallel_slots = {} (edit .kern/config.toml to change — see \
+                     README's \"Indexing throughput\" section before raising it)",
+                    cfg.embedding.parallel_slots
+                );
+            }
             match &cfg.extraction {
                 Some(ext) => {
                     println!("extraction.provider = {}", ext.provider);

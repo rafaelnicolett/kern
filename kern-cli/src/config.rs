@@ -71,6 +71,23 @@ pub struct EmbeddingConfig {
     /// serving parameters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
+    /// `llama_cpp_embedded` only, ignored for `"ollama"` (which has its
+    /// own real lever — `OLLAMA_NUM_PARALLEL`, see the README's "Indexing
+    /// throughput" section). Sets `-np` on the bundled `llama-server`:
+    /// how many requests it processes in parallel. Defaults to `1` —
+    /// measured against kern's own bundled model with short prompts,
+    /// raising this made things *slower*, not faster (the model's
+    /// individual requests were fast enough that `-np`'s own scheduling
+    /// overhead dominated). That measurement doesn't necessarily
+    /// generalize to a much slower per-request workload (large chunks, a
+    /// different `.gguf`, slower hardware) — hand-edit this and measure
+    /// against your own real corpus before trusting either direction.
+    #[serde(default = "default_parallel_slots")]
+    pub parallel_slots: u32,
+}
+
+fn default_parallel_slots() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +143,7 @@ mod tests {
                 model: "all-minilm".to_string(),
                 dimension: 384,
                 context_size: None,
+                parallel_slots: 1,
             },
             extraction: Some(ExtractionConfig {
                 provider: "ollama".to_string(),
@@ -169,6 +187,27 @@ mod tests {
     }
 
     #[test]
+    fn parallel_slots_defaults_when_the_config_file_predates_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A config.toml written before parallel_slots existed on
+        // [embedding] — same shape as pre-existing real projects.
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n[embedding]\nprovider = \"llama_cpp_embedded\"\nmodel = \"all-MiniLM-L6-v2-ggml-model-f16.gguf\"\ndimension = 384\ncontext_size = 512\n",
+        )
+        .unwrap();
+
+        let loaded = load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            loaded.embedding.parallel_slots,
+            default_parallel_slots(),
+            "a pre-existing config without parallel_slots should default, not fail to load"
+        );
+    }
+
+    #[test]
     fn extraction_is_omitted_from_the_file_when_not_configured() {
         let dir = tempfile::tempdir().unwrap();
         let config = ProjectConfig {
@@ -178,6 +217,7 @@ mod tests {
                 model: "all-MiniLM-L6-v2-ggml-model-f16.gguf".to_string(),
                 dimension: 384,
                 context_size: Some(512),
+                parallel_slots: 1,
             },
             extraction: None,
             indexing: IndexingConfig::default(),

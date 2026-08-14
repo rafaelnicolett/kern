@@ -62,6 +62,7 @@ pub async fn resolve_embedding_config(
                 model,
                 dimension: caps.embedding_dim as i32,
                 context_size: None,
+                parallel_slots: 1, // ignored for ollama — OLLAMA_NUM_PARALLEL governs it instead
             })
         }
         EmbeddingChoice::LlamaCppEmbedded => {
@@ -75,6 +76,10 @@ pub async fn resolve_embedding_config(
                 model: model_name,
                 dimension: caps.embedding_dim as i32,
                 context_size: Some(BUNDLED_MODEL_CONTEXT_SIZE),
+                // Safe default — see EmbeddingConfig::parallel_slots' doc
+                // comment. Hand-edit .kern/config.toml to try a higher
+                // value against your own real corpus.
+                parallel_slots: 1,
             })
         }
     }
@@ -166,21 +171,16 @@ pub async fn build_providers_from_config(
                     .embedding
                     .context_size
                     .unwrap_or(BUNDLED_MODEL_CONTEXT_SIZE),
-                // Deliberately NOT config.indexing.chunk_concurrency — the
-                // obvious-looking choice (kern owns both ends of this
-                // subprocess, so why not keep them equal?) was tried and
-                // measured against the real bundled model: parallel_slots=4
-                // was consistently ~8-9% SLOWER than 1, not faster, at both
-                // small and large concurrent-call counts. This tiny
-                // quantized model's individual requests are fast enough
-                // that -np's scheduling overhead outweighs any real
-                // parallelism gained — unlike Ollama's much larger
-                // generative model, where more real slots measurably
-                // helped. Default stays 1 (matches pre-fix behavior, zero
-                // regression risk) until a model/workload is found where
-                // raising it actually measures faster — see the README's
-                // "Indexing throughput" section.
-                parallel_slots: 1,
+                // From .kern/config.toml's [embedding] parallel_slots —
+                // deliberately NOT config.indexing.chunk_concurrency (the
+                // obvious-looking choice, since kern owns both ends of
+                // this one subprocess). Measured against kern's own
+                // bundled model with short prompts, raising this hurt,
+                // not helped — see EmbeddingConfig::parallel_slots' doc
+                // comment for why that doesn't necessarily generalize to
+                // a slower real workload, and hand-edit the config to
+                // test a higher value against your own corpus.
+                parallel_slots: config.embedding.parallel_slots,
             }
         }
         other => anyhow::bail!(

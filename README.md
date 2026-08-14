@@ -239,12 +239,25 @@ measured levers, not guesses:
   of this, `parallel_slots` for the bundled backend defaults to `1` —
   deliberately **not** reusing `chunk_concurrency` the way it might seem
   natural to (kern owns both ends of this one subprocess, so keeping them
-  equal looked obviously correct until it was actually measured) — and
-  isn't currently exposed as a tunable, since there's no evidence yet
-  that any value above `1` helps for the model kern actually bundles. If
-  a future or user-supplied `.gguf` for this backend benefits from more
-  slots, that's a real reason to revisit this, backed by the same kind of
-  measurement — not before.
+  equal looked obviously correct until it was actually measured).
+
+  This measurement used short prompts, though — it says nothing about a
+  workload where each individual `embed()` call is already slow for
+  other reasons (much larger chunks, a different `.gguf`, constrained
+  hardware). That's a different regime, closer to the one where more
+  slots genuinely helped Ollama. `[embedding] parallel_slots` in
+  `.kern/config.toml` is a real, hand-editable knob for exactly this —
+  not auto-tuned, because there's no single right answer without
+  measuring your own corpus on your own hardware:
+
+  ```toml
+  [embedding]
+  parallel_slots = 4
+  ```
+
+  `kern config show --project <name>` prints the value currently in
+  effect. Change it, re-run `kern serve`, and compare — the same
+  discipline this project applied to itself above, not a guess.
 
 ## Installing
 
