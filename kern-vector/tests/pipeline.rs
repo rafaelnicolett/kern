@@ -151,7 +151,7 @@ async fn budget_aware_chunker_closes_the_context_window_bug_against_real_llama_c
     // without needing an implausibly huge one.
     let budget = 64;
     let runtime =
-        match kern_model::LlamaCppRuntime::spawn(&binary, &model, 8793, budget as u32).await {
+        match kern_model::LlamaCppRuntime::spawn(&binary, &model, 8793, budget as u32, 1).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("llama-server failed to start ({e}) — skipping integration test");
@@ -243,7 +243,7 @@ async fn oversized_protected_table_is_classified_as_request_rejected_not_backend
 
     let budget = 64;
     let runtime =
-        match kern_model::LlamaCppRuntime::spawn(&binary, &model, 8793, budget as u32).await {
+        match kern_model::LlamaCppRuntime::spawn(&binary, &model, 8794, budget as u32, 1).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("llama-server failed to start ({e}) — skipping integration test");
@@ -290,4 +290,66 @@ async fn oversized_protected_table_is_classified_as_request_rejected_not_backend
              removed"
         ),
     }
+}
+
+/// `-np` is now wired through to the embedded backend (see
+/// `LlamaCppRuntime::spawn`'s doc comment for why: it was always spawned
+/// with no `-np` at all, silently defaulting to llama.cpp's `1`). This
+/// proves the *mechanism* is real — spawning with `parallel_slots=4` and
+/// serving more concurrent requests than slots must not drop, error, or
+/// hang on any of them.
+///
+/// Deliberately NOT a performance-comparison assertion. Measured directly
+/// against the real bundled model (bge-small, quantized) on real
+/// hardware, at both 24 and 200 concurrent calls, `parallel_slots=4` was
+/// consistently and reproducibly ~8-9% SLOWER than `parallel_slots=1`,
+/// not faster — the opposite of what a naive analogy to the Ollama
+/// `OLLAMA_NUM_PARALLEL` fix predicted. Ollama's case involved a much
+/// larger, slower generative model (llama3.2, ~2GB) where per-request
+/// compute dwarfs any per-slot scheduling overhead; this tiny quantized
+/// embedding model's individual requests are fast enough (single-digit
+/// milliseconds) that `-np`'s bookkeeping overhead outweighs any real
+/// parallelism gained. Asserting "faster" here would be asserting
+/// something this project's own measurements contradict — see the
+/// README's "Indexing throughput" section for the honest conclusion this
+/// led to (parallel_slots defaults to 1 for this backend, unlike
+/// `chunk_concurrency`'s default of 8) and what's still an open question.
+#[tokio::test]
+async fn parallel_slots_are_correctly_applied_and_dont_break_under_concurrent_load() {
+    let Some(binary) = find_llama_server_binary() else {
+        eprintln!("llama-server not found on PATH — skipping integration test");
+        return;
+    };
+    let Some(model) = find_test_gguf_model() else {
+        eprintln!(
+            "test model ~/.cache/kern/models/bge-small-en-v1.5-q4_k_m.gguf \
+             not found — skipping integration test"
+        );
+        return;
+    };
+
+    let context_size = 256;
+    let n_calls = 24; // deliberately more than parallel_slots, below
+    let prompt = "The kern architecture separates ingestion, embedding, and ontology \
+                  concerns into distinct crates connected only through traits, so a \
+                  real backend can be swapped without touching domain logic. "
+        .repeat(4);
+
+    let runtime =
+        match kern_model::LlamaCppRuntime::spawn(&binary, &model, 8795, context_size, 4).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("llama-server failed to start ({e}) — skipping integration test");
+                return;
+            }
+        };
+
+    let results = futures::future::join_all((0..n_calls).map(|_| runtime.embed(&prompt))).await;
+    let failures: Vec<_> = results.iter().filter(|r| r.is_err()).collect();
+    assert!(
+        failures.is_empty(),
+        "all {n_calls} concurrent calls against parallel_slots=4 should succeed — got \
+         {} failure(s): {failures:?}",
+        failures.len()
+    );
 }

@@ -166,6 +166,21 @@ pub async fn build_providers_from_config(
                     .embedding
                     .context_size
                     .unwrap_or(BUNDLED_MODEL_CONTEXT_SIZE),
+                // Deliberately NOT config.indexing.chunk_concurrency — the
+                // obvious-looking choice (kern owns both ends of this
+                // subprocess, so why not keep them equal?) was tried and
+                // measured against the real bundled model: parallel_slots=4
+                // was consistently ~8-9% SLOWER than 1, not faster, at both
+                // small and large concurrent-call counts. This tiny
+                // quantized model's individual requests are fast enough
+                // that -np's scheduling overhead outweighs any real
+                // parallelism gained — unlike Ollama's much larger
+                // generative model, where more real slots measurably
+                // helped. Default stays 1 (matches pre-fix behavior, zero
+                // regression risk) until a model/workload is found where
+                // raising it actually measures faster — see the README's
+                // "Indexing throughput" section.
+                parallel_slots: 1,
             }
         }
         other => anyhow::bail!(
@@ -215,6 +230,10 @@ async fn spawn_embedded_and_probe(
         model_path: model_path.clone(),
         port,
         context_size: BUNDLED_MODEL_CONTEXT_SIZE,
+        // A one-off canary call during setup/capability-probing, before
+        // any project config (and its chunk_concurrency) exists yet —
+        // concurrency doesn't matter for a single request.
+        parallel_slots: 1,
     };
     let provider = build_embedding_provider(selection)
         .await

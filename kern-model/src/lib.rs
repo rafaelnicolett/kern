@@ -150,16 +150,40 @@ impl LlamaCppRuntime {
     /// Starts `llama-server` pointing at the `.gguf` in `model_path`, on
     /// port `port` (localhost only), and waits for `/health` to respond OK
     /// before returning — never returns a runtime that isn't yet ready to
-    /// serve embeddings. `context_size` is passed explicitly as both `-c`
-    /// and `-b`/`-ub` — the caller decides it (kern has to know its own
-    /// backend's real limit, not guess), rather than silently inheriting
-    /// whatever llama-server's build default happens to be.
+    /// serve embeddings. `context_size` is the budget available to a
+    /// *single* request — the caller decides it (kern has to know its own
+    /// backend's real limit, not guess) — and is what `capabilities()`
+    /// reports as `max_input_tokens`, unaffected by `parallel_slots` below.
+    ///
+    /// `parallel_slots` sets `-np`: real bug found empirically (an
+    /// external test against a 3710-file corpus projected a ~5 hour cold
+    /// index) — this runtime was always spawned with no `-np` at all,
+    /// silently defaulting to llama.cpp's built-in `1`, so kern-cli's own
+    /// `chunk_concurrency` (client-side) had nothing real to overlap
+    /// against on this backend — every request queued behind a single
+    /// processing slot regardless of how many kern fired concurrently
+    /// (the same class of bug already found and fixed for Ollama's
+    /// `OLLAMA_NUM_PARALLEL`, except kern owns this subprocess directly,
+    /// so there's no external daemon/env var dependency to work around).
+    ///
+    /// `-c` is llama-server's *total* context across all slots, not
+    /// per-slot (confirmed empirically: `-c 131072 -np 4` reported
+    /// `n_ctx_slot=32768`) — passed here as `context_size * parallel_slots`
+    /// so each slot still gets the full `context_size` budget the caller
+    /// asked for. Getting this wrong (passing `context_size` unscaled)
+    /// would silently shrink the real per-slot budget under
+    /// `parallel_slots > 1`, reintroducing the oversized-chunk-rejection
+    /// bug this same budget accounting already closed once. `-b`/`-ub`
+    /// stay at `context_size` (per-slot, unscaled) — unchanged from
+    /// before, not tuned further here.
     pub async fn spawn(
         binary_path: &std::path::Path,
         model_path: &std::path::Path,
         port: u16,
         context_size: u32,
+        parallel_slots: u32,
     ) -> Result<Self, ModelError> {
+        let total_context = context_size.saturating_mul(parallel_slots.max(1));
         let mut child = tokio::process::Command::new(binary_path)
             .arg("-m")
             .arg(model_path)
@@ -169,11 +193,13 @@ impl LlamaCppRuntime {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("-c")
-            .arg(context_size.to_string())
+            .arg(total_context.to_string())
             .arg("-b")
             .arg(context_size.to_string())
             .arg("-ub")
             .arg(context_size.to_string())
+            .arg("-np")
+            .arg(parallel_slots.max(1).to_string())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -746,6 +772,9 @@ pub enum EmbeddingProviderSelection {
         model_path: std::path::PathBuf,
         port: u16,
         context_size: u32,
+        /// See `LlamaCppRuntime::spawn`'s doc comment — real backend
+        /// concurrency (`-np`), not just a client-side queue depth.
+        parallel_slots: u32,
     },
 }
 
@@ -765,9 +794,16 @@ pub async fn build_embedding_provider(
             model_path,
             port,
             context_size,
+            parallel_slots,
         } => {
-            let runtime =
-                LlamaCppRuntime::spawn(&binary_path, &model_path, port, context_size).await?;
+            let runtime = LlamaCppRuntime::spawn(
+                &binary_path,
+                &model_path,
+                port,
+                context_size,
+                parallel_slots,
+            )
+            .await?;
             Ok(std::sync::Arc::new(runtime))
         }
     }
@@ -936,7 +972,7 @@ mod tests {
             return;
         };
 
-        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8791, 512)
+        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8791, 512, 1)
             .await
             .expect("llama-server should start and become ready within the timeout");
 
@@ -965,7 +1001,7 @@ mod tests {
             return;
         };
 
-        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8792, 512)
+        let runtime = LlamaCppRuntime::spawn(&binary, &model, 8792, 512, 1)
             .await
             .expect("llama-server should start and become ready within the timeout");
 

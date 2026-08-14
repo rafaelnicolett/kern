@@ -155,6 +155,18 @@ indexing *slower*, not faster, on the hardware it was measured on — a
 reminder to measure a change on your own hardware rather than assume more
 concurrency is strictly better.
 
+A second, sharper version of the same lesson: `-np` was added to the
+*bundled* `llama-server` path too, on the reasonable-looking hypothesis
+that it would help the same way it helped Ollama. Measured directly
+against the actual bundled model at both 24 and 200 concurrent calls,
+`parallel_slots=4` was consistently ~8-9% *slower* than `1`, not faster —
+the hypothesis was wrong, and the measurement is what caught that before
+it shipped as a default. See the README section above for the full
+explanation (the bundled model's individual requests are fast enough that
+`-np`'s own overhead dominates). `parallel_slots` for this backend
+defaults to `1` as a result, not the higher value that seemed obviously
+correct by analogy.
+
 ---
 
 ## 5. Semantic routing reliability

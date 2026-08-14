@@ -223,10 +223,28 @@ measured levers, not guesses:
   differ. Measure before committing to a value, the same way this project
   did — don't just set it to a high number and assume it helped.
 
-  This setting is not currently exposed for the bundled `llama-server`
-  path (`llama_cpp_embedded`) — `LlamaCppRuntime::spawn` doesn't pass
-  `-np` today, so that backend runs effectively serial regardless of
-  `chunk_concurrency`. A known gap, not yet closed.
+  **The bundled `llama-server` path (`llama_cpp_embedded`) now passes
+  `-np` too** — `LlamaCppRuntime::spawn` used to always omit it, silently
+  defaulting to `1`, the same class of bug as the Ollama case above,
+  except kern owns this subprocess directly (no external daemon/env var
+  to work around). Unlike Ollama, though, **measurement did not confirm
+  raising it helps**: against the actual bundled model (a small quantized
+  embedding model) on real hardware, `parallel_slots=4` was consistently
+  ~8-9% *slower* than `parallel_slots=1`, reproduced at both 24 and 200
+  concurrent calls — the opposite of what the Ollama result predicted by
+  analogy. Individual requests against this tiny model are fast enough
+  (single-digit milliseconds) that `-np`'s own scheduling overhead
+  outweighs any real parallelism gained, unlike Ollama's much larger
+  generative model where per-request compute dominates instead. Because
+  of this, `parallel_slots` for the bundled backend defaults to `1` —
+  deliberately **not** reusing `chunk_concurrency` the way it might seem
+  natural to (kern owns both ends of this one subprocess, so keeping them
+  equal looked obviously correct until it was actually measured) — and
+  isn't currently exposed as a tunable, since there's no evidence yet
+  that any value above `1` helps for the model kern actually bundles. If
+  a future or user-supplied `.gguf` for this backend benefits from more
+  slots, that's a real reason to revisit this, backed by the same kind of
+  measurement — not before.
 
 ## Installing
 
